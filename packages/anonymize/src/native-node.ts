@@ -1,0 +1,302 @@
+import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
+import process from "node:process";
+
+import {
+  assertNativeBindingVersion,
+  createNativePipelineFromPackage,
+  type NativeAnonymizeBinding,
+  type PreparedNativePipeline,
+} from "./native";
+
+export * from "./native";
+
+export type NativeRequire = (specifier: string) => unknown;
+
+export type NativeLibc = "gnu" | "musl";
+
+export type LoadNativeBindingOptions = {
+  expectedVersion?: string;
+  platform?: string;
+  arch?: string;
+  libc?: NativeLibc;
+  env?: Record<string, string | undefined>;
+  requireModule?: NativeRequire;
+};
+
+export type NativePipelinePackageFileOptions = LoadNativeBindingOptions & {
+  binding?: NativeAnonymizeBinding;
+  packagePath: string;
+};
+
+export type DefaultNativePipelinePackageOptions = LoadNativeBindingOptions & {
+  binding?: NativeAnonymizeBinding;
+  packagePath?: string;
+};
+
+type ResolvedDefaultNativePipelineOptions = {
+  binding: NativeAnonymizeBinding;
+  packagePath?: string;
+};
+
+const LOCAL_NATIVE_LOADER = "../index.cjs";
+const PACKAGE_SPECIFIC_NATIVE_PATH = "STELLA_ANONYMIZE_NATIVE_LIBRARY_PATH";
+const DEFAULT_NATIVE_PIPELINE_PACKAGE_URL = new URL(
+  "../native-pipeline.stlanonpkg",
+  import.meta.url,
+);
+const DEFAULT_NATIVE_PIPELINE_PACKAGE_CACHE_KEY = "<default>";
+const defaultNativePipelineCache = new WeakMap<
+  NativeAnonymizeBinding,
+  Map<string, PreparedNativePipeline>
+>();
+
+export { DEFAULT_NATIVE_PIPELINE_CONFIG } from "./native-default-config";
+
+export const loadNativeAnonymizeBinding = (
+  options: LoadNativeBindingOptions = {},
+): NativeAnonymizeBinding => {
+  const requireModule = options.requireModule ?? createRequire(import.meta.url);
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  const env = options.env ?? process.env;
+  const specifiers = nativeBindingSpecifiers({ env });
+  const errors: string[] = [];
+
+  for (const specifier of specifiers) {
+    const binding = tryLoadNativeBinding({
+      specifier,
+      requireModule,
+      errors,
+    });
+    if (!binding) {
+      continue;
+    }
+    if (options.expectedVersion !== undefined) {
+      assertNativeBindingVersion({
+        binding,
+        expectedVersion: options.expectedVersion,
+      });
+    }
+    return binding;
+  }
+
+  throw new Error(
+    `Unable to load native anonymize binding for ${platform}/${arch}:\n${errors.join("\n")}`,
+  );
+};
+
+export const readNativePipelinePackageFile = (
+  packagePath: string,
+): Uint8Array => new Uint8Array(readFileSync(packagePath));
+
+export const readDefaultNativePipelinePackageFile = (): Uint8Array => {
+  try {
+    return new Uint8Array(readFileSync(DEFAULT_NATIVE_PIPELINE_PACKAGE_URL));
+  } catch (error) {
+    throw new Error(
+      `Default native pipeline package is unavailable: ${formatLoadError(error)}`,
+    );
+  }
+};
+
+export const createNativePipelineFromPackageFile = ({
+  binding,
+  packagePath,
+  expectedVersion,
+  ...loadOptions
+}: NativePipelinePackageFileOptions): PreparedNativePipeline => {
+  const resolvedBinding =
+    binding ??
+    loadNativeAnonymizeBinding({
+      ...loadOptions,
+      ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+    });
+  if (binding && expectedVersion !== undefined) {
+    assertNativeBindingVersion({ binding, expectedVersion });
+  }
+  return createNativePipelineFromPackage({
+    binding: resolvedBinding,
+    packageBytes: readNativePipelinePackageFile(packagePath),
+  });
+};
+
+export const createNativePipelineFromDefaultPackage = ({
+  binding,
+  packagePath,
+  expectedVersion,
+  ...loadOptions
+}: DefaultNativePipelinePackageOptions = {}): PreparedNativePipeline => {
+  const resolvedBinding =
+    binding ??
+    loadNativeAnonymizeBinding({
+      ...loadOptions,
+      ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+    });
+  if (binding && expectedVersion !== undefined) {
+    assertNativeBindingVersion({ binding, expectedVersion });
+  }
+  return createNativePipelineFromResolvedDefaultPackage({
+    binding: resolvedBinding,
+    ...(packagePath !== undefined ? { packagePath } : {}),
+  });
+};
+
+export const getDefaultNativePipeline = ({
+  binding,
+  packagePath,
+  expectedVersion,
+  ...loadOptions
+}: DefaultNativePipelinePackageOptions = {}): PreparedNativePipeline => {
+  const resolvedBinding =
+    binding ??
+    loadNativeAnonymizeBinding({
+      ...loadOptions,
+      ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+    });
+  if (binding && expectedVersion !== undefined) {
+    assertNativeBindingVersion({ binding, expectedVersion });
+  }
+  const cache = defaultPipelineCacheFor(resolvedBinding);
+  const key = defaultPipelineCacheKey({
+    binding: resolvedBinding,
+    ...(packagePath !== undefined ? { packagePath } : {}),
+  });
+  const cached = cache.get(key);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const pipeline = createNativePipelineFromResolvedDefaultPackage({
+    binding: resolvedBinding,
+    ...(packagePath !== undefined ? { packagePath } : {}),
+  });
+  cache.set(key, pipeline);
+  return pipeline;
+};
+
+export const preloadDefaultNativePipeline = getDefaultNativePipeline;
+
+const createNativePipelineFromResolvedDefaultPackage = ({
+  binding,
+  packagePath,
+}: ResolvedDefaultNativePipelineOptions): PreparedNativePipeline => {
+  const packageBytes =
+    packagePath === undefined
+      ? readDefaultNativePipelinePackageFile()
+      : readNativePipelinePackageFile(packagePath);
+  return createNativePipelineFromPackage({
+    binding,
+    packageBytes,
+  });
+};
+
+const defaultPipelineCacheFor = (
+  binding: NativeAnonymizeBinding,
+): Map<string, PreparedNativePipeline> => {
+  const cached = defaultNativePipelineCache.get(binding);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const created = new Map<string, PreparedNativePipeline>();
+  defaultNativePipelineCache.set(binding, created);
+  return created;
+};
+
+const defaultPipelineCacheKey = ({
+  binding,
+  packagePath,
+}: ResolvedDefaultNativePipelineOptions): string =>
+  [
+    binding.nativePackageVersion(),
+    packagePath ?? DEFAULT_NATIVE_PIPELINE_PACKAGE_CACHE_KEY,
+  ].join("\0");
+
+type NativeBindingSpecifiersOptions = {
+  env: Record<string, string | undefined>;
+};
+
+const nativeBindingSpecifiers = ({
+  env,
+}: NativeBindingSpecifiersOptions): string[] => {
+  const specifiers: string[] = [];
+  const overridePath = env[PACKAGE_SPECIFIC_NATIVE_PATH];
+  if (overridePath) {
+    specifiers.push(overridePath);
+  }
+  specifiers.push(LOCAL_NATIVE_LOADER);
+  return specifiers;
+};
+
+type TryLoadNativeBindingOptions = {
+  specifier: string;
+  requireModule: NativeRequire;
+  errors: string[];
+};
+
+const tryLoadNativeBinding = ({
+  specifier,
+  requireModule,
+  errors,
+}: TryLoadNativeBindingOptions): NativeAnonymizeBinding | null => {
+  try {
+    const loaded = requireModule(specifier);
+    const binding = toNativeAnonymizeBinding(loaded);
+    if (binding) {
+      return binding;
+    }
+    errors.push(`${specifier}: module does not match native binding shape`);
+  } catch (error) {
+    errors.push(`${specifier}: ${formatLoadError(error)}`);
+  }
+  return null;
+};
+
+const toNativeAnonymizeBinding = (
+  value: unknown,
+): NativeAnonymizeBinding | null => {
+  const candidate =
+    isPropertyBag(value) && isPropertyBag(value["default"])
+      ? value["default"]
+      : value;
+  return isNativeAnonymizeBinding(candidate) ? candidate : null;
+};
+
+const isNativeAnonymizeBinding = (
+  candidate: unknown,
+): candidate is NativeAnonymizeBinding => {
+  if (!isPropertyBag(candidate)) {
+    return false;
+  }
+  if (typeof candidate["nativePackageVersion"] !== "function") {
+    return false;
+  }
+  if (typeof candidate["prepareStaticSearchPackageBytes"] !== "function") {
+    return false;
+  }
+  if (
+    typeof candidate["prepareStaticSearchCompressedPackageBytes"] !== "function"
+  ) {
+    return false;
+  }
+  const preparedSearch = candidate["NativePreparedSearch"];
+  if (!isPropertyBag(preparedSearch)) {
+    return false;
+  }
+  if (typeof preparedSearch["fromConfigJsonBytes"] !== "function") {
+    return false;
+  }
+  if (typeof preparedSearch["fromPreparedPackageBytes"] !== "function") {
+    return false;
+  }
+  return true;
+};
+
+const isPropertyBag = (value: unknown): value is Record<string, unknown> =>
+  (typeof value === "object" && value !== null) || typeof value === "function";
+
+const formatLoadError = (error: unknown): string => {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+};

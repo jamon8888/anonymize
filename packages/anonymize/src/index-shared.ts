@@ -49,6 +49,46 @@ export type {
   PipelineSearchOptions,
 } from "./pipeline";
 
+// ── Native Adapter ───────────────────────────────
+export {
+  PreparedNativeAnonymizer,
+  assertNativeBindingVersion,
+  createNativeAnonymizerFromConfig,
+  createNativeAnonymizerFromPackage,
+  encodeNativeSearchConfig,
+  getNativeBindingVersion,
+  prepareNativeSearchPackage,
+} from "./native";
+export type {
+  NativeAnonymizeBinding,
+  NativeAnonymizerFromConfigOptions,
+  NativeAnonymizerFromPackageOptions,
+  NativeBindingVersionOptions,
+  NativeOperatorConfig,
+  NativePipelineEntity,
+  NativePipelineFromPackageOptions,
+  NativePreparedSearchBinding,
+  NativeRedactionResult,
+  NativeSearchPackageOptions,
+  NativeStaticRedactionResult,
+} from "./native";
+export { DEFAULT_NATIVE_PIPELINE_CONFIG } from "./native-default-config";
+export {
+  PreparedNativePipeline,
+  assertNativePipelineSupported,
+  createNativePipelineFromConfig,
+  createNativePipelineFromPackage,
+  getNativePipelineCompatibility,
+  prepareNativePipelineConfig,
+  prepareNativePipelinePackage,
+} from "./native-pipeline";
+export type {
+  NativePipelineBuildOptions,
+  NativePipelineCompatibility,
+  NativePipelinePackageOptions,
+  NativePipelineUnsupportedFeature,
+} from "./native-pipeline";
+
 // ── Redaction ─────────────────────────────────────
 export {
   redactText,
