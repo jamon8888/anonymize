@@ -16,12 +16,14 @@ export const PIPELINE_TO_MODEL: Record<string, readonly string[]> = {
   date: ["sensitive_date", "document_date", "expiration_date"],
 };
 
-const MODEL_TO_PIPELINE: Record<string, string> = {};
+// Build reverse map: model label -> array of pipeline labels (in PIPELINE_TO_MODEL order)
+const MODEL_TO_PIPELINE_MAP: Record<string, string[]> = {};
 for (const [pipeline, models] of Object.entries(PIPELINE_TO_MODEL)) {
   for (const model of models) {
-    if (!(model in MODEL_TO_PIPELINE)) {
-      MODEL_TO_PIPELINE[model] = pipeline;
+    if (!MODEL_TO_PIPELINE_MAP[model]) {
+      MODEL_TO_PIPELINE_MAP[model] = [];
     }
+    MODEL_TO_PIPELINE_MAP[model].push(pipeline);
   }
 }
 
@@ -45,16 +47,14 @@ export const collapseLabel = (
   modelLabel: string,
   requestedPipelineLabels: ReadonlySet<string>,
 ): string => {
-  const defaultLabel = MODEL_TO_PIPELINE[modelLabel];
-  if (!defaultLabel) return modelLabel;
+  const candidates = MODEL_TO_PIPELINE_MAP[modelLabel];
+  if (!candidates) return modelLabel;
 
-  if (requestedPipelineLabels.has(defaultLabel)) return defaultLabel;
-
-  for (const [pipeline, models] of Object.entries(PIPELINE_TO_MODEL)) {
-    if (models.includes(modelLabel) && requestedPipelineLabels.has(pipeline)) {
-      return pipeline;
-    }
+  // Find the first candidate that was in the original requested labels (preserves caller order)
+  for (const candidate of candidates) {
+    if (requestedPipelineLabels.has(candidate)) return candidate;
   }
 
-  return defaultLabel;
+  // Fall back to the first pipeline label in our map
+  return candidates[0] ?? modelLabel;
 };

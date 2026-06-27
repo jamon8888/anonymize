@@ -19,6 +19,6 @@ pub(crate) async fn health_handler(
   Json(HealthResponse {
     status: "ok".into(),
     model_loaded,
-    version: "0.1.0".into(),
+    version: env!("CARGO_PKG_VERSION").into(),
   })
 }

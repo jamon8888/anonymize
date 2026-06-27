@@ -12,7 +12,7 @@
 
 ---
 
-### Prerequisite: Register crate in workspace
+## Prerequisite: Register crate in workspace
 
 - [ ] **Step 0 (before Task 1, committed with Task 1's Step 7)**
 

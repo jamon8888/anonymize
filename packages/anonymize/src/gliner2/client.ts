@@ -7,6 +7,7 @@ export type Gliner2ClientOptions = {
   modelId?: string;
   variant?: string;
   modelLoadTimeout?: number;
+  inferenceTimeout?: number;
 };
 
 export class Gliner2Client {
@@ -22,11 +23,25 @@ export class Gliner2Client {
       modelId: opts.modelId ?? "SemplificaAI/gliner2-privacy-filter-PII-multi",
       variant: opts.variant ?? "",
       modelLoadTimeout: opts.modelLoadTimeout ?? 120_000,
+      inferenceTimeout: opts.inferenceTimeout ?? 30_000,
     };
   }
 
   get isRunning(): boolean {
-    return this.process !== null && this.port !== null;
+    if (!this.process || this.port == null) {
+      return false;
+    }
+    const { exitCode, killed } = this.process;
+    if (exitCode !== null || killed) {
+      return false;
+    }
+    return true;
+  }
+
+  private clearProcessState(): void {
+    this.process = null;
+    this.port = null;
+    this.baseUrl = null;
   }
 
   async start(): Promise<void> {
@@ -41,13 +56,18 @@ export class Gliner2Client {
       stdio: ["ignore", "pipe", "inherit"],
     });
 
+    this.process.on("exit", () => this.clearProcessState());
+    this.process.on("error", () => this.clearProcessState());
+
     const stdout = this.process.stdout;
     if (!stdout) {
+      this.clearProcessState();
       throw new Error("Failed to start gliner2-server: no stdout");
     }
 
     const decoder = new TextDecoder();
     let buffer = "";
+    let listeningEventReceived = false;
 
     for await (const chunk of stdout) {
       buffer += decoder.decode(chunk, { stream: true });
@@ -60,6 +80,7 @@ export class Gliner2Client {
           if (parsed.event === "listening") {
             this.port = parsed.port as number;
             this.baseUrl = `http://127.0.0.1:${this.port}`;
+            listeningEventReceived = true;
             break;
           }
         } catch {
@@ -71,8 +92,14 @@ export class Gliner2Client {
       buffer = lines.at(-1) ?? "";
     }
 
-    if (!this.baseUrl) {
-      throw new Error("Failed to start gliner2-server: no listening event");
+    if (!listeningEventReceived) {
+      const exitCode = this.process.exitCode;
+      this.clearProcessState();
+      throw new Error(
+        `Failed to start gliner2-server: sidecar exited prematurely${
+          exitCode !== null ? ` (exit code ${exitCode})` : ""
+        }`,
+      );
     }
 
     await this.waitForModel();
@@ -106,19 +133,36 @@ export class Gliner2Client {
     if (!this.isRunning) await this.start();
 
     const body: InferRequest = { text, labels, threshold };
-    const res = await fetch(`${this.baseUrl}/v1/infer`, {
+    const fetchOptions: RequestInit = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: signal ?? null,
-    });
+    };
 
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`Inference failed (${res.status}): ${errText}`);
+    // Compose caller signal with internal timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.opts.inferenceTimeout);
+
+    if (signal) {
+      signal.addEventListener("abort", () => controller.abort());
     }
 
-    return res.json() as Promise<InferResponse>;
+    fetchOptions.signal = controller.signal;
+
+    try {
+      const res = await fetch(`${this.baseUrl}/v1/infer`, fetchOptions);
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Inference failed (${res.status}): ${errText}`);
+      }
+
+      return res.json() as Promise<InferResponse>;
+    } catch (e) {
+      clearTimeout(timeoutId);
+      throw e;
+    }
   }
 
   async stop(): Promise<void> {
@@ -142,9 +186,7 @@ export class Gliner2Client {
 
     await exited;
 
-    this.process = null;
-    this.port = null;
-    this.baseUrl = null;
+    this.clearProcessState();
   }
 
   dispose(): void {
@@ -152,12 +194,13 @@ export class Gliner2Client {
   }
 
   private async resolveBinary(): Promise<string> {
+    if (this.opts.binaryPath) return this.opts.binaryPath;
     const envPath = process.env["ANONYMIZE_GLINER2_SERVER_PATH"];
     if (envPath) return envPath;
 
     throw new Error(
       "gliner2-server binary not found. " +
-        "Set ANONYMIZE_GLINER2_SERVER_PATH or use a bundled installation.",
+        "Provide binaryPath option or set ANONYMIZE_GLINER2_SERVER_PATH.",
     );
   }
 }

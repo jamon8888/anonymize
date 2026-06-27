@@ -12,13 +12,16 @@ pub(crate) async fn get_or_init(
   let variant = variant.map(|s| s.to_string());
   ENGINE
     .get_or_try_init(|| async move {
-      ort::init().with_name("GLiNER2_Engine").commit()?;
-      let engine = Gliner2Engine::from_pretrained(
-        &model_id,
-        variant.as_deref(),
-        ModelType::HuggingFace,
-      )?;
-      Ok(Arc::new(engine))
+      tokio::task::spawn_blocking(move || {
+        ort::init().with_name("GLiNER2_Engine").commit()?;
+        let engine = Gliner2Engine::from_pretrained(
+          &model_id,
+          variant.as_deref(),
+          ModelType::HuggingFace,
+        )?;
+        Ok::<_, anyhow::Error>(Arc::new(engine))
+      })
+      .await?
     })
     .await
     .map(Arc::clone)

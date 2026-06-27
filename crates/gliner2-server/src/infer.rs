@@ -29,14 +29,23 @@ pub(crate) async fn infer_handler(
     flat_ner: true,
   };
 
-  let (entities, _, _) = engine
-    .extract(&req.text, &tasks, Some(params))
-    .map_err(|e| {
-      (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("inference failed: {e}"),
-      )
-    })?;
+  let text = req.text;
+  let (entities, _, _) = tokio::task::spawn_blocking(move || {
+    engine.extract(&text, &tasks, Some(params))
+  })
+  .await
+  .map_err(|e| {
+    (
+      StatusCode::INTERNAL_SERVER_ERROR,
+      format!("inference task join error: {e}"),
+    )
+  })?
+  .map_err(|e| {
+    (
+      StatusCode::INTERNAL_SERVER_ERROR,
+      format!("inference failed: {e}"),
+    )
+  })?;
 
   let output: Vec<EntityOutput> = entities
     .into_iter()

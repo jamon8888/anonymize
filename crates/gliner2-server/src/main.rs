@@ -2,7 +2,7 @@
 
 use axum::{Router, serve};
 use clap::Parser;
-use std::io::Write;
+use std::io::{stdout, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -49,7 +49,8 @@ async fn main() -> anyhow::Result<()> {
       Ok(listener) => {
         let local = listener.local_addr()?;
         let startup = serde_json::json!({"event":"listening","host":format!("{}", local.ip()),"port":local.port()});
-        writeln!(std::io::stdout(), "{startup}")?;
+        writeln!(stdout(), "{startup}")?;
+        stdout().flush()?;
         let state = Arc::new(infer::AppState {
           model_id: cli.model.clone(),
           variant: cli.variant.clone(),
