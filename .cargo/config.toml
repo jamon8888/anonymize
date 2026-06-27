@@ -2,10 +2,9 @@
 [registries.crates-io]
 protocol = "sparse"
 
-# Build artifacts: configurable via ANONYMIZE_CARGO_TARGET_DIR env var
+# Build artifacts: set CARGO_TARGET_DIR env var to customize location
 # Defaults to local target/ if not set (works on all platforms)
-[build]
-target-dir = { env = "ANONYMIZE_CARGO_TARGET_DIR", default = "target" }
+# Example: export CARGO_TARGET_DIR=E:/cargo-target/anonymize
 
 [alias]
 ci-fmt = "fmt --all -- --check"
