@@ -1,4 +1,4 @@
-import type { NerInferenceFn } from "../pipeline";
+import type { NerInferenceFn } from "../types";
 import type { Entity } from "../types";
 import { Gliner2Client, type Gliner2ClientOptions } from "./client";
 import { expandLabels, collapseLabel } from "./label-map";

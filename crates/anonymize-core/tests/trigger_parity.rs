@@ -1,13 +1,16 @@
 #![allow(clippy::expect_used)]
 
+mod support;
+
 use stella_anonymize_core::{
-  PatternSlice, PreparedSearch, PreparedSearchConfig, PreparedSearchSlices,
+  PatternSlice, PreparedEngine, PreparedEngineConfig, PreparedEngineSlices,
   SearchOptions, SearchPattern, StaticDetectionResult, TriggerData,
   TriggerRule, TriggerStrategy, TriggerValidation,
 };
+use support::prepared_config;
 
-fn empty_config(slices: PreparedSearchSlices) -> PreparedSearchConfig {
-  PreparedSearchConfig {
+fn empty_config(slices: PreparedEngineSlices) -> PreparedEngineConfig {
+  prepared_config! {
     regex_patterns: vec![],
     custom_regex_patterns: vec![],
     literal_patterns: vec![],
@@ -17,7 +20,7 @@ fn empty_config(slices: PreparedSearchSlices) -> PreparedSearchConfig {
     allowed_labels: vec![],
     threshold: 0.0,
     confidence_boost: false,
-    slices,
+    slices: slices,
     regex_meta: vec![],
     custom_regex_meta: vec![],
     deny_list_data: None,
@@ -32,6 +35,7 @@ fn empty_config(slices: PreparedSearchSlices) -> PreparedSearchConfig {
     address_context_data: None,
     coreference_data: None,
     name_corpus_data: None,
+    signature_data: None,
     date_data: None,
     monetary_data: None,
   }
@@ -41,16 +45,37 @@ fn prepared_for_trigger(
   trigger: &str,
   label: &str,
   strategy: TriggerStrategy,
-) -> PreparedSearch {
-  PreparedSearch::new(PreparedSearchConfig {
+) -> PreparedEngine {
+  prepared_for_trigger_with_support(
+    trigger,
+    label,
+    strategy,
+    TriggerSupport::default(),
+  )
+}
+
+#[derive(Default)]
+struct TriggerSupport {
+  phone_extension_labels: Vec<String>,
+  number_markers: Vec<String>,
+  number_labels: Vec<String>,
+}
+
+fn prepared_for_trigger_with_support(
+  trigger: &str,
+  label: &str,
+  strategy: TriggerStrategy,
+  support: TriggerSupport,
+) -> PreparedEngine {
+  PreparedEngine::new(prepared_config! {
     regex_patterns: vec![SearchPattern::LiteralWithOptions {
       pattern: trigger.to_lowercase(),
       case_insensitive: Some(true),
       whole_words: Some(false),
     }],
-    slices: PreparedSearchSlices {
+    slices: PreparedEngineSlices {
       triggers: PatternSlice { start: 0, end: 1 },
-      ..PreparedSearchSlices::default()
+      ..PreparedEngineSlices::default()
     },
     trigger_data: Some(TriggerData {
       rules: vec![TriggerRule {
@@ -69,15 +94,19 @@ fn prepared_for_trigger(
         String::from("MBA"),
       ],
       sentence_terminal_currency_terms: vec![String::from("Kč")],
+      phone_extension_labels: support.phone_extension_labels,
+      number_markers: support.number_markers,
+      number_labels: support.number_labels,
     }),
-    ..empty_config(PreparedSearchSlices::default())
+    ..empty_config(PreparedEngineSlices::default())
   })
   .expect("trigger config should prepare")
 }
 
 fn trigger_texts(result: &StaticDetectionResult) -> Vec<&str> {
   result
-    .trigger_entities
+    .entities
+    .trigger()
     .iter()
     .map(|entity| entity.text.as_str())
     .collect()
@@ -103,15 +132,79 @@ fn uppercase_configured_id_triggers_accept_lowercase_source_forms() {
     assert!(
       trigger_texts(&result).contains(&expected),
       "trigger {trigger} should extract {expected:?}; entities: {:?}",
-      result.trigger_entities,
+      result.entities.trigger(),
     );
   }
 }
 
 #[test]
+fn company_id_trigger_uses_configured_number_labels() {
+  let prepared = prepared_for_trigger_with_support(
+    "KRS",
+    "registration number",
+    TriggerStrategy::CompanyIdValue,
+    TriggerSupport {
+      number_labels: vec![String::from("nr.")],
+      ..TriggerSupport::default()
+    },
+  );
+
+  let result = prepared
+    .detect_static_entities("KRS nr. 0000123456")
+    .expect("static detection should succeed");
+
+  assert_eq!(trigger_texts(&result), ["0000123456"]);
+}
+
+#[test]
+fn n_words_trigger_skips_configured_number_markers() {
+  let prepared = prepared_for_trigger_with_support(
+    "case",
+    "matter id",
+    TriggerStrategy::NWords { count: 2 },
+    TriggerSupport {
+      number_markers: vec![String::from("no")],
+      ..TriggerSupport::default()
+    },
+  );
+
+  let result = prepared
+    .detect_static_entities("case no ABC 123")
+    .expect("static detection should succeed");
+
+  assert_eq!(trigger_texts(&result), ["ABC 123"]);
+}
+
+#[test]
+fn n_words_trigger_advances_across_multibyte_whitespace() {
+  let prepared = prepared_for_trigger(
+    "case",
+    "matter id",
+    TriggerStrategy::NWords { count: 2 },
+  );
+
+  let result = prepared
+    .detect_static_entities("case ABC\u{00a0}123")
+    .expect("static detection should succeed");
+
+  assert_eq!(trigger_texts(&result), ["ABC\u{00a0}123"]);
+}
+
+#[test]
 fn labelled_phone_trigger_keeps_extension_suffixes() {
-  let prepared =
-    prepared_for_trigger("PHONE", "phone number", TriggerStrategy::ToEndOfLine);
+  let prepared = prepared_for_trigger_with_support(
+    "PHONE",
+    "phone number",
+    TriggerStrategy::ToEndOfLine,
+    TriggerSupport {
+      phone_extension_labels: vec![
+        String::from("extension"),
+        String::from("ext"),
+        String::from("x"),
+      ],
+      ..TriggerSupport::default()
+    },
+  );
 
   for (text, expected) in [
     (
@@ -134,7 +227,7 @@ fn labelled_phone_trigger_keeps_extension_suffixes() {
     assert!(
       trigger_texts(&result).contains(&expected),
       "phone trigger should keep extension in {expected:?}; entities: {:?}",
-      result.trigger_entities,
+      result.entities.trigger(),
     );
   }
 }
@@ -193,7 +286,7 @@ fn match_pattern_trigger_requires_match_at_value_start() {
     .detect_static_entities("Telephone : 123456789 SIREN")
     .expect("static detection should succeed");
 
-  assert!(rejected.trigger_entities.is_empty());
+  assert!(rejected.entities.trigger().is_empty());
   assert_eq!(trigger_texts(&accepted), ["123456789"]);
 }
 
@@ -215,7 +308,7 @@ fn to_next_comma_stops_after_short_currency_abbreviation_sentence_tail() {
   assert!(
     trigger_texts(&result).contains(&"100 Kč"),
     "currency sentence tail should stop the capture; entities: {:?}",
-    result.trigger_entities,
+    result.entities.trigger(),
   );
 }
 
@@ -239,17 +332,21 @@ fn to_next_comma_stops_on_unicode_case_stop_words() {
 
 #[test]
 fn company_id_trigger_rejects_single_digit_dotted_date() {
-  let prepared = prepared_for_trigger(
+  let prepared = prepared_for_trigger_with_support(
     "DNI",
     "national identification number",
     TriggerStrategy::CompanyIdValue,
+    TriggerSupport {
+      number_labels: vec![String::from("no")],
+      ..TriggerSupport::default()
+    },
   );
 
   let result = prepared
     .detect_static_entities("DNI 6.11.2025")
     .expect("static detection should succeed");
 
-  assert!(result.trigger_entities.is_empty());
+  assert!(result.entities.trigger().is_empty());
 }
 
 #[test]
@@ -267,7 +364,7 @@ fn company_id_trigger_caps_leading_alpha_prefixes() {
     .detect_static_entities("Company No. AB12345")
     .expect("static detection should succeed");
 
-  assert!(rejected.trigger_entities.is_empty());
+  assert!(rejected.entities.trigger().is_empty());
   assert_eq!(trigger_texts(&accepted), ["AB12345"]);
 }
 
@@ -288,7 +385,7 @@ fn address_trigger_stops_after_short_proper_noun_before_real_sentence() {
   assert!(
     trigger_texts(&result).contains(&"Brno"),
     "proper-noun sentence tail should stop the address; entities: {:?}",
-    result.trigger_entities,
+    result.entities.trigger(),
   );
 }
 

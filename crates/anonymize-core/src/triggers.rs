@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use fancy_regex::Regex as FancyRegex;
 use regex::{Regex, RegexBuilder};
 
@@ -25,6 +27,12 @@ pub struct TriggerData {
   #[serde(default)]
   pub post_nominals: Vec<String>,
   pub sentence_terminal_currency_terms: Vec<String>,
+  #[serde(default)]
+  pub phone_extension_labels: Vec<String>,
+  #[serde(default)]
+  pub number_markers: Vec<String>,
+  #[serde(default)]
+  pub number_labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -79,6 +87,21 @@ pub(crate) struct PreparedTriggerData {
   legal_form_suffixes: Vec<String>,
   post_nominals: Vec<String>,
   sentence_terminal_currency_terms: Vec<String>,
+  phone_extension_labels: Vec<String>,
+  number_markers: Vec<String>,
+  number_labels: Vec<String>,
+}
+
+#[derive(Default)]
+struct TriggerRegexCache {
+  regex: BTreeMap<TriggerPatternKey, Regex>,
+  fancy_regex: BTreeMap<TriggerPatternKey, FancyRegex>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TriggerPatternKey {
+  pattern: String,
+  flags: Option<String>,
 }
 
 struct PreparedTriggerRule {
@@ -129,14 +152,18 @@ struct TriggerExtractionData<'a> {
   party_position_terms: &'a [String],
   post_nominals: &'a [String],
   sentence_terminal_currency_terms: &'a [String],
+  phone_extension_labels: &'a [String],
+  number_markers: &'a [String],
+  number_labels: &'a [String],
 }
 
 impl PreparedTriggerData {
   pub(crate) fn new(data: TriggerData) -> Result<Self> {
+    let mut regex_cache = TriggerRegexCache::default();
     let rules = data
       .rules
       .into_iter()
-      .map(PreparedTriggerRule::new)
+      .map(|rule| PreparedTriggerRule::new(rule, &mut regex_cache))
       .collect::<Result<Vec<_>>>()?;
     Ok(Self {
       rules,
@@ -153,20 +180,40 @@ impl PreparedTriggerData {
         .into_iter()
         .filter(|term| !term.is_empty())
         .collect(),
+      phone_extension_labels: data
+        .phone_extension_labels
+        .into_iter()
+        .filter(|term| !term.is_empty())
+        .collect(),
+      number_markers: data
+        .number_markers
+        .into_iter()
+        .filter(|term| !term.is_empty())
+        .collect(),
+      number_labels: data
+        .number_labels
+        .into_iter()
+        .filter(|term| !term.is_empty())
+        .collect(),
     })
   }
 }
 
 impl PreparedTriggerRule {
-  fn new(rule: TriggerRule) -> Result<Self> {
+  fn new(
+    rule: TriggerRule,
+    regex_cache: &mut TriggerRegexCache,
+  ) -> Result<Self> {
     Ok(Self {
       trigger: rule.trigger,
       label: rule.label,
-      strategy: PreparedTriggerStrategy::new(rule.strategy)?,
+      strategy: PreparedTriggerStrategy::new(rule.strategy, regex_cache)?,
       validations: rule
         .validations
         .into_iter()
-        .map(PreparedTriggerValidation::new)
+        .map(|validation| {
+          PreparedTriggerValidation::new(validation, regex_cache)
+        })
         .collect::<Result<Vec<_>>>()?,
       include_trigger: rule.include_trigger,
     })
@@ -174,7 +221,10 @@ impl PreparedTriggerRule {
 }
 
 impl PreparedTriggerStrategy {
-  fn new(strategy: TriggerStrategy) -> Result<Self> {
+  fn new(
+    strategy: TriggerStrategy,
+    regex_cache: &mut TriggerRegexCache,
+  ) -> Result<Self> {
     Ok(match strategy {
       TriggerStrategy::ToNextComma {
         stop_words,
@@ -192,14 +242,17 @@ impl PreparedTriggerStrategy {
         max_chars: max_chars.and_then(|value| usize::try_from(value).ok()),
       },
       TriggerStrategy::MatchPattern { pattern, flags } => Self::MatchPattern {
-        regex: build_fancy_regex(&format!("^(?:{pattern})"), flags.as_deref())?,
+        regex: regex_cache.fancy_regex(format!("^(?:{pattern})"), flags)?,
       },
     })
   }
 }
 
 impl PreparedTriggerValidation {
-  fn new(validation: TriggerValidation) -> Result<Self> {
+  fn new(
+    validation: TriggerValidation,
+    regex_cache: &mut TriggerRegexCache,
+  ) -> Result<Self> {
     Ok(match validation {
       TriggerValidation::StartsUppercase => Self::StartsUppercase,
       TriggerValidation::MinLength(min) => {
@@ -212,11 +265,39 @@ impl PreparedTriggerValidation {
       TriggerValidation::HasDigits => Self::HasDigits,
       TriggerValidation::MatchesPattern { pattern, flags } => {
         Self::MatchesPattern {
-          regex: build_regex(&pattern, flags.as_deref())?,
+          regex: regex_cache.regex(pattern, flags)?,
         }
       }
       TriggerValidation::ValidId { validator } => Self::ValidId { validator },
     })
+  }
+}
+
+impl TriggerRegexCache {
+  fn regex(&mut self, pattern: String, flags: Option<String>) -> Result<Regex> {
+    let key = TriggerPatternKey { pattern, flags };
+    if let Some(regex) = self.regex.get(&key) {
+      return Ok(regex.clone());
+    }
+
+    let regex = build_regex(&key.pattern, key.flags.as_deref())?;
+    self.regex.insert(key, regex.clone());
+    Ok(regex)
+  }
+
+  fn fancy_regex(
+    &mut self,
+    pattern: String,
+    flags: Option<String>,
+  ) -> Result<FancyRegex> {
+    let key = TriggerPatternKey { pattern, flags };
+    if let Some(regex) = self.fancy_regex.get(&key) {
+      return Ok(regex.clone());
+    }
+
+    let regex = build_fancy_regex(&key.pattern, key.flags.as_deref())?;
+    self.fancy_regex.insert(key, regex.clone());
+    Ok(regex)
   }
 }
 
@@ -234,6 +315,9 @@ pub(crate) fn process_trigger_matches(
     party_position_terms: &data.party_position_terms,
     post_nominals: &data.post_nominals,
     sentence_terminal_currency_terms: &data.sentence_terminal_currency_terms,
+    phone_extension_labels: &data.phone_extension_labels,
+    number_markers: &data.number_markers,
+    number_labels: &data.number_labels,
   };
 
   for found in matches {
@@ -389,14 +473,22 @@ fn extract_value(
       data.post_nominals,
       data.sentence_terminal_currency_terms,
     ),
-    PreparedTriggerStrategy::ToEndOfLine => {
-      extract_to_end_of_line(remaining, stripped, value_start_byte, label)
-    }
-    PreparedTriggerStrategy::NWords { count } => {
-      extract_n_words(stripped, value_start_byte, *count, label)
-    }
+    PreparedTriggerStrategy::ToEndOfLine => extract_to_end_of_line(
+      remaining,
+      stripped,
+      value_start_byte,
+      label,
+      data.phone_extension_labels,
+    ),
+    PreparedTriggerStrategy::NWords { count } => extract_n_words(
+      stripped,
+      value_start_byte,
+      *count,
+      label,
+      data.number_markers,
+    ),
     PreparedTriggerStrategy::CompanyIdValue => {
-      extract_company_id_value(text, trigger_end_byte)
+      extract_company_id_value(text, trigger_end_byte, data.number_labels)
     }
     PreparedTriggerStrategy::Address { max_chars } => extract_address(
       stripped,
@@ -469,6 +561,7 @@ fn extract_to_end_of_line(
   value_text: &str,
   value_start_byte: usize,
   label: &str,
+  phone_extension_labels: &[String],
 ) -> Option<ByteValue> {
   let consumed = remaining.len().saturating_sub(value_text.len());
   if consumed > 0 && remaining.get(..consumed)?.contains('\n') {
@@ -485,7 +578,8 @@ fn extract_to_end_of_line(
     }
   }
   if label == "phone number"
-    && let Some(shape_end) = phone_shape_end(value_text.get(..end)?)
+    && let Some(shape_end) =
+      phone_shape_end(value_text.get(..end)?, phone_extension_labels)
     && shape_end < end
   {
     end = shape_end.min(MAX_TRIGGER_VALUE_LEN);
@@ -502,16 +596,16 @@ fn extract_n_words(
   value_start_byte: usize,
   count: usize,
   _label: &str,
+  number_markers: &[String],
 ) -> Option<ByteValue> {
   let cell_end = value_text.find('\t').unwrap_or(value_text.len());
   let cell = value_text.get(..cell_end)?;
   let mut words = Vec::<WordToken<'_>>::new();
   for word in cell.split_whitespace() {
-    if punctuation_only(word) || number_marker(word) {
+    if punctuation_only(word) || number_marker(word, number_markers) {
       continue;
     }
-    let search_pos =
-      words.last().map_or(0, |entry| entry.end.saturating_add(1));
+    let search_pos = words.last().map_or(0, |entry| entry.end);
     let relative = cell.get(search_pos..)?.find(word)?;
     let start = search_pos.saturating_add(relative);
     words.push(WordToken {
@@ -542,6 +636,7 @@ struct WordToken<'a> {
 fn extract_company_id_value(
   text: &str,
   trigger_end_byte: usize,
+  number_labels: &[String],
 ) -> Option<ByteValue> {
   let raw = text.get(trigger_end_byte..)?;
   let trigger_last = text.get(..trigger_end_byte)?.chars().next_back();
@@ -549,7 +644,7 @@ fn extract_company_id_value(
   let sep_len = separator_len(raw, allow_empty_sep)?;
   let mut after_sep = raw.get(sep_len..)?;
   let mut label_offset = 0;
-  if let Some(len) = number_label_len(after_sep) {
+  if let Some(len) = number_label_len(after_sep, number_labels) {
     label_offset = len;
     after_sep = after_sep.get(len..)?;
   }
@@ -1116,14 +1211,16 @@ fn punctuation_only(text: &str) -> bool {
   text.chars().all(|ch| !ch.is_alphanumeric())
 }
 
-fn number_marker(text: &str) -> bool {
-  matches!(
-    text.to_ascii_lowercase().as_str(),
-    "nº" | "no" | "n°" | "n." | "№"
-  )
+fn number_marker(text: &str, number_markers: &[String]) -> bool {
+  number_markers
+    .iter()
+    .any(|marker| text.eq_ignore_ascii_case(marker))
 }
 
-fn phone_shape_end(text: &str) -> Option<usize> {
+fn phone_shape_end(
+  text: &str,
+  phone_extension_labels: &[String],
+) -> Option<usize> {
   let mut chars = text.char_indices();
   let (_, first) = chars.next()?;
   if !(first == '+' || first == '(' || first.is_ascii_digit()) {
@@ -1155,22 +1252,26 @@ fn phone_shape_end(text: &str) -> Option<usize> {
   {
     end = end.saturating_sub(next_len_backward(text, end));
   }
-  if let Some(extension_len) =
-    text.get(end..).and_then(phone_extension_suffix_len)
+  if let Some(extension_len) = text
+    .get(end..)
+    .and_then(|tail| phone_extension_suffix_len(tail, phone_extension_labels))
   {
     end = end.saturating_add(extension_len);
   }
   (end > 0).then_some(end)
 }
 
-fn phone_extension_suffix_len(text: &str) -> Option<usize> {
+fn phone_extension_suffix_len(
+  text: &str,
+  phone_extension_labels: &[String],
+) -> Option<usize> {
   let leading = text.len().saturating_sub(text.trim_start().len());
   let trimmed = text.get(leading..)?;
-  for label in ["extension", "ext", "x"] {
+  for label in phone_extension_labels {
     let Some(rest) = ascii_case_prefix_rest(trimmed, label) else {
       continue;
     };
-    let (rest, dot_len) = if label == "ext" {
+    let (rest, dot_len) = if label.eq_ignore_ascii_case("ext") {
       rest
         .strip_prefix('.')
         .map_or((rest, 0_usize), |after_dot| (after_dot, 1_usize))
@@ -1335,9 +1436,8 @@ fn separator_len(raw: &str, allow_empty: bool) -> Option<usize> {
   None
 }
 
-fn number_label_len(text: &str) -> Option<usize> {
-  let labels = ["nr", "nr.", "numer", "nº", "no", "no.", "n°", "n.", "№"];
-  for label in labels {
+fn number_label_len(text: &str, number_labels: &[String]) -> Option<usize> {
+  for label in number_labels {
     let Some(rest) = text.get(label.len()..) else {
       continue;
     };
@@ -1558,6 +1658,9 @@ mod tests {
       legal_form_suffixes: Vec::new(),
       post_nominals: Vec::new(),
       sentence_terminal_currency_terms: Vec::new(),
+      phone_extension_labels: Vec::new(),
+      number_markers: Vec::new(),
+      number_labels: Vec::new(),
     })
     .unwrap();
 
@@ -1631,6 +1734,9 @@ mod tests {
       legal_form_suffixes: Vec::new(),
       post_nominals: Vec::new(),
       sentence_terminal_currency_terms: Vec::new(),
+      phone_extension_labels: Vec::new(),
+      number_markers: Vec::new(),
+      number_labels: Vec::new(),
     })
     .unwrap();
 
@@ -1671,6 +1777,9 @@ mod tests {
       legal_form_suffixes: Vec::new(),
       post_nominals: Vec::new(),
       sentence_terminal_currency_terms: Vec::new(),
+      phone_extension_labels: Vec::new(),
+      number_markers: Vec::new(),
+      number_labels: Vec::new(),
     })
     .unwrap();
 

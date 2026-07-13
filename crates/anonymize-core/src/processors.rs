@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+
+use smallvec::SmallVec;
 
 use crate::byte_offsets::ByteOffsets;
 use crate::resolution::{DetectionSource, PipelineEntity, SourceDetail};
@@ -100,29 +102,77 @@ pub struct DenyListMatchData {
   pub labels: StringGroups,
   pub custom_labels: StringGroups,
   pub originals: Vec<String>,
+  #[serde(default)]
+  pub pattern_meta: DenyListPatternMetaSet,
   pub sources: StringGroups,
   pub filters: Option<DenyListFilterData>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
-pub struct StringGroups {
-  table: Vec<String>,
-  groups: Vec<Vec<u32>>,
+#[derive(
+  Clone,
+  Copy,
+  Debug,
+  Default,
+  Eq,
+  PartialEq,
+  serde::Deserialize,
+  serde::Serialize,
+)]
+pub struct DenyListPatternMeta {
+  pub has_alphanumeric: bool,
+  pub short_upper_acronym: bool,
 }
 
-impl<'de> serde::Deserialize<'de> for StringGroups {
-  fn deserialize<D: serde::Deserializer<'de>>(
-    deserializer: D,
-  ) -> std::result::Result<Self, D::Error> {
-    #[derive(serde::Deserialize)]
-    struct RawStringGroups {
-      table: Vec<String>,
-      groups: Vec<Vec<u32>>,
-    }
-    let raw = RawStringGroups::deserialize(deserializer)?;
-    StringGroups::from_table_indices(raw.table, raw.groups, "string_groups")
-      .map_err(|e| serde::de::Error::custom(e.to_string()))
-  }
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct DenyListPatternMetaSet {
+  len: usize,
+  has_alphanumeric: Vec<u8>,
+  short_upper_acronym: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StringGroups {
+  table: Vec<String>,
+  groups: Vec<StringGroupIndexes>,
+  group_table: Vec<StringGroupIndexes>,
+  group_refs: Vec<u32>,
+  empty_len: usize,
+}
+
+type StringGroupIndexes = SmallVec<[u32; 2]>;
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StringGroupsWire {
+  Empty {
+    len: usize,
+  },
+  Groups {
+    table: Vec<String>,
+    groups: Vec<StringGroupIndexes>,
+  },
+  Refs {
+    table: Vec<String>,
+    group_table: Vec<StringGroupIndexes>,
+    group_refs: Vec<u32>,
+  },
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StringGroupsWireRef<'a> {
+  Empty {
+    len: usize,
+  },
+  Groups {
+    table: &'a [String],
+    groups: &'a [StringGroupIndexes],
+  },
+  Refs {
+    table: &'a [String],
+    group_table: &'a [StringGroupIndexes],
+    group_refs: &'a [u32],
+  },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,11 +194,11 @@ impl StringGroups {
           .map(|value| {
             string_table_index(value, &mut table, &mut table_indexes)
           })
-          .collect()
+          .collect::<StringGroupIndexes>()
       })
       .collect();
 
-    Self { table, groups }
+    Self::from_table_and_groups(table, groups)
   }
 
   pub fn from_table_indices(
@@ -173,46 +223,418 @@ impl StringGroups {
       }
     }
 
-    Ok(Self { table, groups })
+    let groups = groups
+      .into_iter()
+      .map(StringGroupIndexes::from_vec)
+      .collect();
+
+    Ok(Self::from_table_and_groups(table, groups))
   }
 
   #[must_use]
-  pub fn empty_groups(len: usize) -> Self {
+  pub const fn empty_groups(len: usize) -> Self {
     Self {
       table: Vec::new(),
-      groups: vec![Vec::new(); len],
+      groups: Vec::new(),
+      group_table: Vec::new(),
+      group_refs: Vec::new(),
+      empty_len: len,
     }
   }
 
   #[must_use]
   pub const fn len(&self) -> usize {
-    self.groups.len()
+    if self.empty_len > 0 {
+      return self.empty_len;
+    }
+    if self.group_refs.is_empty() {
+      return self.groups.len();
+    }
+    self.group_refs.len()
   }
 
   #[must_use]
   pub const fn is_empty(&self) -> bool {
-    self.groups.is_empty()
+    self.len() == 0
   }
 
   #[must_use]
   pub fn get(&self, index: usize) -> Option<StringGroup<'_>> {
+    let indexes = self.group_indexes(index)?;
     Some(StringGroup {
       table: &self.table,
-      indexes: self.groups.get(index)?,
+      indexes,
     })
   }
 
   pub fn iter(&self) -> impl Iterator<Item = StringGroup<'_>> {
-    self.groups.iter().map(|indexes| StringGroup {
-      table: &self.table,
-      indexes,
+    (0..self.len()).filter_map(|index| self.get(index))
+  }
+
+  pub fn validate(&self, field: &'static str) -> Result<()> {
+    if self.empty_len > 0 {
+      if self.table.is_empty()
+        && self.groups.is_empty()
+        && self.group_table.is_empty()
+        && self.group_refs.is_empty()
+      {
+        return Ok(());
+      }
+      return Err(Error::InvalidStaticData {
+        field,
+        reason: String::from("empty string groups carry data"),
+      });
+    }
+
+    if self.group_refs.is_empty() {
+      validate_group_indexes(field, &self.table, &self.groups)?;
+      return Ok(());
+    }
+
+    validate_group_indexes(field, &self.table, &self.group_table)?;
+    for &group_ref in &self.group_refs {
+      let Ok(index) = usize::try_from(group_ref) else {
+        return Err(Error::InvalidStaticData {
+          field,
+          reason: String::from("group reference exceeds usize range"),
+        });
+      };
+      if index >= self.group_table.len() {
+        return Err(Error::InvalidStaticData {
+          field,
+          reason: String::from("group reference out of range"),
+        });
+      }
+    }
+    Ok(())
+  }
+
+  fn from_table_and_groups(
+    table: Vec<String>,
+    groups: Vec<StringGroupIndexes>,
+  ) -> Self {
+    let (group_table, group_refs) = compact_repeated_groups(&groups);
+    if group_table.len() < groups.len() {
+      return Self {
+        table,
+        groups: Vec::new(),
+        group_table,
+        group_refs,
+        empty_len: 0,
+      };
+    }
+
+    Self {
+      table,
+      groups,
+      group_table: Vec::new(),
+      group_refs: Vec::new(),
+      empty_len: 0,
+    }
+  }
+
+  fn group_indexes(&self, index: usize) -> Option<&[u32]> {
+    if self.empty_len > 0 {
+      return (index < self.empty_len).then_some(&[]);
+    }
+    if self.group_refs.is_empty() {
+      return self.groups.get(index).map(SmallVec::as_slice);
+    }
+    let group_ref = *self.group_refs.get(index)?;
+    let group_index = usize::try_from(group_ref).ok()?;
+    self.group_table.get(group_index).map(SmallVec::as_slice)
+  }
+}
+
+fn compact_repeated_groups(
+  groups: &[StringGroupIndexes],
+) -> (Vec<StringGroupIndexes>, Vec<u32>) {
+  let mut table = Vec::<StringGroupIndexes>::new();
+  let mut table_indexes = BTreeMap::<Vec<u32>, u32>::new();
+  let mut refs = Vec::with_capacity(groups.len());
+  for group in groups {
+    let key = group.to_vec();
+    let index = match table_indexes.entry(key) {
+      Entry::Occupied(entry) => *entry.get(),
+      Entry::Vacant(entry) => {
+        let index = u32::try_from(table.len()).unwrap_or(u32::MAX);
+        entry.insert(index);
+        table.push(group.clone());
+        index
+      }
+    };
+    refs.push(index);
+  }
+  (table, refs)
+}
+
+fn validate_group_indexes(
+  field: &'static str,
+  table: &[String],
+  groups: &[StringGroupIndexes],
+) -> Result<()> {
+  for group in groups {
+    for &index in group {
+      let Ok(index) = usize::try_from(index) else {
+        return Err(Error::InvalidStaticData {
+          field,
+          reason: String::from("string table index exceeds usize range"),
+        });
+      };
+      if index >= table.len() {
+        return Err(Error::InvalidStaticData {
+          field,
+          reason: String::from("string table index out of range"),
+        });
+      }
+    }
+  }
+  Ok(())
+}
+
+impl DenyListMatchData {
+  pub fn compact_runtime_patterns(&mut self) {
+    if self.originals.is_empty() {
+      return;
+    }
+
+    self.pattern_meta = DenyListPatternMetaSet::from_patterns(&self.originals);
+    self.originals.clear();
+  }
+
+  fn pattern_meta(&self, index: usize) -> DenyListPatternMeta {
+    self
+      .pattern_meta
+      .get(index)
+      .or_else(|| {
+        self
+          .originals
+          .get(index)
+          .map(|pattern| DenyListPatternMeta::from_pattern(pattern))
+      })
+      .unwrap_or_default()
+  }
+}
+
+impl DenyListPatternMetaSet {
+  #[must_use]
+  pub fn from_entries(entries: &[DenyListPatternMeta]) -> Self {
+    if entries.is_empty() {
+      return Self::default();
+    }
+
+    let len = entries.len();
+    let mut has_alphanumeric = vec![0u8; bitset_len(len)];
+    let mut short_upper_acronym = vec![0u8; bitset_len(len)];
+    for (index, entry) in entries.iter().enumerate() {
+      if entry.has_alphanumeric {
+        set_bit(&mut has_alphanumeric, index);
+      }
+      if entry.short_upper_acronym {
+        set_bit(&mut short_upper_acronym, index);
+      }
+    }
+    Self {
+      len,
+      has_alphanumeric,
+      short_upper_acronym,
+    }
+  }
+
+  #[must_use]
+  pub fn from_patterns(patterns: &[String]) -> Self {
+    let entries = patterns
+      .iter()
+      .map(|pattern| DenyListPatternMeta::from_pattern(pattern))
+      .collect::<Vec<_>>();
+    Self::from_entries(&entries)
+  }
+
+  #[must_use]
+  pub const fn len(&self) -> usize {
+    self.len
+  }
+
+  #[must_use]
+  pub const fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+
+  #[must_use]
+  pub fn first(&self) -> Option<DenyListPatternMeta> {
+    self.get(0)
+  }
+
+  #[must_use]
+  pub fn get(&self, index: usize) -> Option<DenyListPatternMeta> {
+    if index >= self.len {
+      return None;
+    }
+    Some(DenyListPatternMeta {
+      has_alphanumeric: has_bit(&self.has_alphanumeric, index),
+      short_upper_acronym: has_bit(&self.short_upper_acronym, index),
     })
+  }
+}
+
+impl<'de> serde::Deserialize<'de> for DenyListPatternMetaSet {
+  fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    #[derive(serde::Deserialize)]
+    struct Wire {
+      len: usize,
+      has_alphanumeric: Vec<u8>,
+      short_upper_acronym: Vec<u8>,
+    }
+
+    let wire = Wire::deserialize(deserializer)?;
+    validate_meta_bitsets(
+      wire.len,
+      &wire.has_alphanumeric,
+      &wire.short_upper_acronym,
+    )
+    .map_err(serde::de::Error::custom)?;
+    Ok(Self {
+      len: wire.len,
+      has_alphanumeric: wire.has_alphanumeric,
+      short_upper_acronym: wire.short_upper_acronym,
+    })
+  }
+}
+
+const fn bitset_len(len: usize) -> usize {
+  len.div_ceil(8)
+}
+
+fn validate_meta_bitsets(
+  len: usize,
+  has_alphanumeric: &[u8],
+  short_upper_acronym: &[u8],
+) -> std::result::Result<(), String> {
+  let expected_len = bitset_len(len);
+  if has_alphanumeric.len() != expected_len {
+    return Err(format!(
+      "has_alphanumeric bitset length mismatch: expected {expected_len}, got {}",
+      has_alphanumeric.len()
+    ));
+  }
+  if short_upper_acronym.len() != expected_len {
+    return Err(format!(
+      "short_upper_acronym bitset length mismatch: expected {expected_len}, got {}",
+      short_upper_acronym.len()
+    ));
+  }
+  if has_unused_bits(has_alphanumeric, len)
+    || has_unused_bits(short_upper_acronym, len)
+  {
+    return Err(String::from("pattern metadata bitset has unused bits set"));
+  }
+  Ok(())
+}
+
+fn set_bit(bits: &mut [u8], index: usize) {
+  let Some(byte) = bits.get_mut(bit_byte_index(index)) else {
+    return;
+  };
+  *byte |= 1u8 << bit_offset(index);
+}
+
+fn has_bit(bits: &[u8], index: usize) -> bool {
+  bits
+    .get(bit_byte_index(index))
+    .is_some_and(|byte| byte & (1u8 << bit_offset(index)) != 0)
+}
+
+const fn bit_byte_index(index: usize) -> usize {
+  index >> 3
+}
+
+const fn bit_offset(index: usize) -> usize {
+  index & 7
+}
+
+fn has_unused_bits(bits: &[u8], len: usize) -> bool {
+  let used_in_last = len % 8;
+  if used_in_last == 0 {
+    return false;
+  }
+  let Some(last) = bits.last() else {
+    return false;
+  };
+  let unused_mask = u8::MAX << used_in_last;
+  last & unused_mask != 0
+}
+
+impl DenyListPatternMeta {
+  fn from_pattern(pattern: &str) -> Self {
+    Self {
+      has_alphanumeric: pattern.chars().any(char::is_alphanumeric),
+      short_upper_acronym: !pattern.is_empty()
+        && pattern.len() <= 5
+        && all_upper(pattern),
+    }
   }
 }
 
 impl From<Vec<Vec<String>>> for StringGroups {
   fn from(groups: Vec<Vec<String>>) -> Self {
     Self::from_groups(groups)
+  }
+}
+
+impl serde::Serialize for StringGroups {
+  fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    let wire = if self.empty_len > 0 {
+      StringGroupsWireRef::Empty {
+        len: self.empty_len,
+      }
+    } else if self.group_refs.is_empty() {
+      StringGroupsWireRef::Groups {
+        table: &self.table,
+        groups: &self.groups,
+      }
+    } else {
+      StringGroupsWireRef::Refs {
+        table: &self.table,
+        group_table: &self.group_table,
+        group_refs: &self.group_refs,
+      }
+    };
+    wire.serialize(serializer)
+  }
+}
+
+impl<'de> serde::Deserialize<'de> for StringGroups {
+  fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    let groups = match StringGroupsWire::deserialize(deserializer)? {
+      StringGroupsWire::Empty { len } => Self::empty_groups(len),
+      StringGroupsWire::Groups { table, groups } => {
+        Self::from_table_and_groups(table, groups)
+      }
+      StringGroupsWire::Refs {
+        table,
+        group_table,
+        group_refs,
+      } => Self {
+        table,
+        groups: Vec::new(),
+        group_table,
+        group_refs,
+        empty_len: 0,
+      },
+    };
+    groups
+      .validate("string_groups")
+      .map_err(serde::de::Error::custom)?;
+    Ok(groups)
   }
 }
 
@@ -290,11 +712,12 @@ pub struct SigningPlaceGuardData {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RawDenyListMatch {
+  pattern: usize,
   start: u32,
   end: u32,
   labels: Vec<String>,
   custom_labels: Vec<String>,
-  sources: Vec<String>,
+  has_person_name_source: bool,
   text: String,
 }
 
@@ -352,56 +775,58 @@ pub fn process_deny_list_matches(
   data: &DenyListMatchData,
 ) -> Result<Vec<PipelineEntity>> {
   let offsets = ByteOffsets::new(full_text);
-  let mut matches_by_pattern =
+  let mut matches =
     collect_deny_list_matches(matches, slice, full_text, data, &offsets)?;
-  suppress_shorter_curated_contained_matches(&mut matches_by_pattern);
+  suppress_shorter_curated_contained_matches(&mut matches);
 
   let mut results = Vec::new();
   let mut name_hits = Vec::new();
 
-  for pattern_matches in matches_by_pattern.values() {
-    for found in pattern_matches {
-      for label in &found.custom_labels {
-        let mut entity = PipelineEntity::detected(
-          found.start,
-          found.end,
-          label.clone(),
-          found.text.clone(),
-          DENY_LIST_SCORE,
-          DetectionSource::DenyList,
-        );
-        entity.source_detail = Some(SourceDetail::CustomDenyList);
-        results.push(entity);
-      }
+  for found in &matches {
+    for label in &found.custom_labels {
+      let mut entity = PipelineEntity::detected(
+        found.start,
+        found.end,
+        label.clone(),
+        found.text.clone(),
+        DENY_LIST_SCORE,
+        DetectionSource::DenyList,
+      );
+      entity.source_detail = Some(SourceDetail::CustomDenyList);
+      results.push(entity);
+    }
+  }
+
+  for found in &matches {
+    if found.labels.is_empty() {
+      continue;
+    }
+    if found.labels.iter().any(|label| label == PERSON_LABEL)
+      && !filter_contains(
+        data
+          .filters
+          .as_ref()
+          .map(|filters| &filters.person_stopwords),
+        &found.text.to_lowercase(),
+      )
+    {
+      name_hits.push(found.clone());
     }
 
-    for found in pattern_matches {
-      if found.labels.iter().any(|label| label == PERSON_LABEL)
-        && !filter_contains(
-          data
-            .filters
-            .as_ref()
-            .map(|filters| &filters.person_stopwords),
-          &found.text.to_lowercase(),
-        )
-      {
-        name_hits.push(found.clone());
+    let suppress_address =
+      should_suppress_address(full_text, &offsets, data, found)?;
+    for label in found.labels.iter().filter(|label| *label != PERSON_LABEL) {
+      if label == ADDRESS_LABEL && suppress_address {
+        continue;
       }
-
-      let suppress_address = should_suppress_address(full_text, data, found)?;
-      for label in found.labels.iter().filter(|label| *label != PERSON_LABEL) {
-        if label == ADDRESS_LABEL && suppress_address {
-          continue;
-        }
-        results.push(PipelineEntity::detected(
-          found.start,
-          found.end,
-          label.clone(),
-          found.text.clone(),
-          DENY_LIST_SCORE,
-          DetectionSource::DenyList,
-        ));
-      }
+      results.push(PipelineEntity::detected(
+        found.start,
+        found.end,
+        label.clone(),
+        found.text.clone(),
+        DENY_LIST_SCORE,
+        DetectionSource::DenyList,
+      ));
     }
   }
 
@@ -423,16 +848,14 @@ pub fn process_deny_list_matches(
 }
 
 fn suppress_shorter_curated_contained_matches(
-  matches_by_pattern: &mut BTreeMap<usize, Vec<RawDenyListMatch>>,
+  matches: &mut [RawDenyListMatch],
 ) {
   let mut ranges = Vec::<(u32, u32)>::new();
-  for matches in matches_by_pattern.values() {
-    for found in matches {
-      if found.labels.is_empty() {
-        continue;
-      }
-      ranges.push((found.start, found.end));
+  for found in matches.iter() {
+    if found.labels.is_empty() {
+      continue;
     }
+    ranges.push((found.start, found.end));
   }
 
   ranges.sort_by(|left, right| {
@@ -461,18 +884,13 @@ fn suppress_shorter_curated_contained_matches(
     return;
   }
 
-  for matches in matches_by_pattern.values_mut() {
-    for found in matches.iter_mut() {
-      if found.labels.is_empty() {
-        continue;
-      }
-      if suppress.contains(&(found.start, found.end)) {
-        found.labels.clear();
-      }
+  for found in matches.iter_mut() {
+    if found.labels.is_empty() {
+      continue;
     }
-    matches.retain(|found| {
-      !found.labels.is_empty() || !found.custom_labels.is_empty()
-    });
+    if suppress.contains(&(found.start, found.end)) {
+      found.labels.clear();
+    }
   }
 }
 
@@ -482,8 +900,8 @@ fn collect_deny_list_matches(
   full_text: &str,
   data: &DenyListMatchData,
   offsets: &ByteOffsets<'_>,
-) -> Result<BTreeMap<usize, Vec<RawDenyListMatch>>> {
-  let mut matches_by_pattern = BTreeMap::<usize, Vec<RawDenyListMatch>>::new();
+) -> Result<Vec<RawDenyListMatch>> {
+  let mut results = Vec::new();
 
   for found in matches {
     let Some(local_index) = slice.local_index(found.pattern()) else {
@@ -499,7 +917,7 @@ fn collect_deny_list_matches(
 
     let match_text = offsets.slice(found.start(), found.end())?;
     let keyword = match_text.to_lowercase();
-    let pattern = data.originals.get(local_index).map_or("", String::as_str);
+    let pattern_meta = data.pattern_meta(local_index);
     let custom_pattern_labels = data
       .custom_labels
       .get(local_index)
@@ -510,7 +928,7 @@ fn collect_deny_list_matches(
       offsets,
       found.start(),
       found.end(),
-      pattern,
+      pattern_meta.has_alphanumeric,
     )?;
     let custom_labels = if custom_edges_are_valid {
       custom_pattern_labels.clone()
@@ -532,7 +950,7 @@ fn collect_deny_list_matches(
         start: found.start(),
         match_text: &match_text,
         keyword: &keyword,
-        pattern,
+        pattern_meta,
         labels,
         custom_pattern_labels: &custom_pattern_labels,
         custom_edges_are_valid,
@@ -546,20 +964,27 @@ fn collect_deny_list_matches(
       continue;
     }
 
-    matches_by_pattern
-      .entry(local_index)
-      .or_default()
-      .push(RawDenyListMatch {
-        start: found.start(),
-        end: found.end(),
-        labels: curated_labels,
-        custom_labels,
-        sources: sources.to_strings(),
-        text: match_text,
-      });
+    results.push(RawDenyListMatch {
+      pattern: local_index,
+      start: found.start(),
+      end: found.end(),
+      labels: curated_labels,
+      custom_labels,
+      has_person_name_source: sources
+        .iter()
+        .any(|source| source == FIRST_NAME_SOURCE || source == SURNAME_SOURCE),
+      text: match_text,
+    });
   }
 
-  Ok(matches_by_pattern)
+  results.sort_by(|left, right| {
+    left
+      .pattern
+      .cmp(&right.pattern)
+      .then_with(|| left.start.cmp(&right.start))
+      .then_with(|| left.end.cmp(&right.end))
+  });
+  Ok(results)
 }
 
 struct CuratedDenyListMatch<'a> {
@@ -568,7 +993,7 @@ struct CuratedDenyListMatch<'a> {
   start: u32,
   match_text: &'a str,
   keyword: &'a str,
-  pattern: &'a str,
+  pattern_meta: DenyListPatternMeta,
   labels: StringGroup<'a>,
   custom_pattern_labels: &'a [String],
   custom_edges_are_valid: bool,
@@ -578,11 +1003,8 @@ struct CuratedDenyListMatch<'a> {
 fn curated_labels_for_match(
   args: &CuratedDenyListMatch<'_>,
 ) -> Result<Vec<String>> {
-  let pattern_is_acronym = !args.pattern.is_empty()
-    && args.pattern.len() <= 5
-    && all_upper(args.pattern);
   let acronym_matches_acronym =
-    !pattern_is_acronym || all_upper(args.match_text);
+    !args.pattern_meta.short_upper_acronym || all_upper(args.match_text);
   let source_char = char_at(args.full_text, args.offsets, args.start)?;
   let passes_filters = source_char.is_some_and(char::is_uppercase)
     && !args.filters.stopwords.contains(args.keyword)
@@ -620,6 +1042,7 @@ fn curated_labels_for_match(
 
 fn should_suppress_address(
   full_text: &str,
+  offsets: &ByteOffsets<'_>,
   data: &DenyListMatchData,
   found: &RawDenyListMatch,
 ) -> Result<bool> {
@@ -629,7 +1052,13 @@ fn should_suppress_address(
   let Some(filters) = &data.filters else {
     return Ok(false);
   };
-  if is_signing_place_context(full_text, found.start, found.end, filters)? {
+  if is_signing_place_context(
+    full_text,
+    offsets,
+    found.start,
+    found.end,
+    filters,
+  )? {
     return Ok(true);
   }
   let lower = found.text.to_lowercase();
@@ -647,6 +1076,7 @@ fn should_suppress_address(
 
 fn is_signing_place_context(
   full_text: &str,
+  offsets: &ByteOffsets<'_>,
   start: u32,
   end: u32,
   filters: &DenyListFilterData,
@@ -655,7 +1085,6 @@ fn is_signing_place_context(
     return Ok(false);
   }
 
-  let offsets = ByteOffsets::new(full_text);
   let start_byte = offsets.validate_offset(start)?;
   let end_byte = offsets.validate_offset(end)?;
   let before = full_text.get(..start_byte).unwrap_or_default();
@@ -689,14 +1118,14 @@ fn context_after_matches_any_phrase(
 
 fn context_before_matches_phrase(before: &str, phrase: &str) -> bool {
   let trimmed = before.trim_end_matches(char::is_whitespace);
-  if trimmed.len() < phrase.len() {
+  let Some((phrase_start, suffix)) =
+    trailing_char_slice(trimmed, phrase.chars().count())
+  else {
+    return false;
+  };
+  if !casefolds_to(suffix, phrase) {
     return false;
   }
-  let lower = trimmed.to_lowercase();
-  if !lower.ends_with(phrase) {
-    return false;
-  }
-  let phrase_start = trimmed.len().saturating_sub(phrase.len());
   char_before_byte(trimmed, phrase_start).is_none_or(|ch| !ch.is_alphanumeric())
 }
 
@@ -705,14 +1134,35 @@ fn context_after_matches_phrase(after: &str, phrase: &str) -> bool {
   let trimmed = trimmed.strip_prefix(',').map_or(trimmed, |value| {
     value.trim_start_matches(char::is_whitespace)
   });
-  if trimmed.len() < phrase.len() {
+  let Some(prefix) = leading_char_slice(trimmed, phrase.chars().count()) else {
+    return false;
+  };
+  if !casefolds_to(prefix, phrase) {
     return false;
   }
-  let lower = trimmed.to_lowercase();
-  if !lower.starts_with(phrase) {
-    return false;
+  char_after_byte(trimmed, prefix.len()).is_none_or(|ch| !ch.is_alphanumeric())
+}
+
+fn trailing_char_slice(text: &str, char_count: usize) -> Option<(usize, &str)> {
+  let mut start = text.len();
+  for _ in 0..char_count {
+    let (previous_start, _) = text.get(..start)?.char_indices().next_back()?;
+    start = previous_start;
   }
-  char_after_byte(trimmed, phrase.len()).is_none_or(|ch| !ch.is_alphanumeric())
+  Some((start, text.get(start..)?))
+}
+
+fn leading_char_slice(text: &str, char_count: usize) -> Option<&str> {
+  let mut end = 0_usize;
+  for _ in 0..char_count {
+    let (index, ch) = text.get(end..)?.char_indices().next()?;
+    end = end.saturating_add(index).saturating_add(ch.len_utf8());
+  }
+  text.get(..end)
+}
+
+fn casefolds_to(value: &str, lower: &str) -> bool {
+  value.to_lowercase() == lower
 }
 
 fn append_person_name_hits(
@@ -723,24 +1173,24 @@ fn append_person_name_hits(
   name_hits: &mut [RawDenyListMatch],
 ) -> Result<()> {
   name_hits.sort_by_key(|hit| hit.start);
-  let mut consumed = BTreeSet::<usize>::new();
+  let mut consumed = vec![false; name_hits.len()];
 
   for index in 0..name_hits.len() {
-    if consumed.contains(&index) {
+    if consumed.get(index).copied().unwrap_or(false) {
       continue;
     }
     let Some(hit) = name_hits.get(index) else {
       continue;
     };
 
-    let mut chain = vec![hit.clone()];
+    let mut chain = vec![hit];
     let mut cursor = index.saturating_add(1);
 
     while cursor < name_hits.len() && chain.len() < 5 {
       let Some(next) = name_hits.get(cursor) else {
         break;
       };
-      let Some(prev) = chain.last() else {
+      let Some(prev) = chain.last().copied() else {
         break;
       };
       if next.start < prev.end {
@@ -751,15 +1201,17 @@ fn append_person_name_hits(
         break;
       }
 
-      chain.push(next.clone());
+      chain.push(next);
       cursor = cursor.saturating_add(1);
     }
 
     for consumed_index in index..index.saturating_add(chain.len()) {
-      consumed.insert(consumed_index);
+      if let Some(entry) = consumed.get_mut(consumed_index) {
+        *entry = true;
+      }
     }
 
-    if !chain.iter().any(has_person_name_source) {
+    if !chain.iter().copied().any(has_person_name_source) {
       continue;
     }
 
@@ -966,11 +1418,8 @@ fn has_curated_source(sources: StringGroup<'_>) -> bool {
     .any(|source| source != CUSTOM_DENY_LIST_SOURCE)
 }
 
-fn has_person_name_source(found: &RawDenyListMatch) -> bool {
-  found
-    .sources
-    .iter()
-    .any(|source| source == FIRST_NAME_SOURCE || source == SURNAME_SOURCE)
+const fn has_person_name_source(found: &RawDenyListMatch) -> bool {
+  found.has_person_name_source
 }
 
 fn filter_contains(set: Option<&BTreeSet<String>>, value: &str) -> bool {
@@ -1563,10 +2012,34 @@ fn strip_defined_term_cue<'a>(
   for cue in &filters.defined_term_cues {
     if lower.starts_with(cue) && word_boundary_after(lower.as_str(), cue.len())
     {
-      return trimmed.get(cue.len()..);
+      // `cue.len()` is a byte offset in the LOWERED text; lowercasing can
+      // change byte lengths (e.g. Turkish dotted capital), so translate to
+      // the matching boundary in the original `trimmed` before slicing.
+      return trimmed.get(original_offset_for_lower_len(trimmed, cue.len())?..);
     }
   }
   None
+}
+
+/// Maps a byte length in `text.to_lowercase()` space back to the byte offset
+/// in `text` whose chars produced exactly that many lowered bytes. Returns
+/// `None` when the lowered length does not land on a char boundary.
+fn original_offset_for_lower_len(
+  text: &str,
+  lower_len: usize,
+) -> Option<usize> {
+  let mut lowered = 0usize;
+  for (offset, ch) in text.char_indices() {
+    if lowered == lower_len {
+      return Some(offset);
+    }
+    if lowered > lower_len {
+      return None;
+    }
+    lowered = lowered
+      .saturating_add(ch.to_lowercase().map(char::len_utf8).sum::<usize>());
+  }
+  (lowered == lower_len).then_some(text.len())
 }
 
 fn word_boundary_after(text: &str, byte: usize) -> bool {
@@ -1862,14 +2335,6 @@ fn try_gazetteer_prefix_extension(
     return Ok(None);
   }
 
-  let suffix = after.get(1..suffix_end as usize).unwrap_or_default().trim();
-  let is_valid_suffix = !suffix.is_empty()
-    && (suffix.chars().next().is_some_and(char::is_uppercase)
-      || suffix.len() >= 6);
-  if !is_valid_suffix {
-    return Ok(None);
-  }
-
   let new_end = found.end().saturating_add(suffix_end);
   Ok(Some((
     new_end,
@@ -1919,9 +2384,9 @@ fn custom_match_has_valid_edges(
   offsets: &ByteOffsets<'_>,
   start: u32,
   end: u32,
-  pattern: &str,
+  pattern_has_alphanumeric: bool,
 ) -> Result<bool> {
-  if !pattern.chars().any(char::is_alphanumeric) {
+  if !pattern_has_alphanumeric {
     return Ok(true);
   }
 
@@ -1949,4 +2414,73 @@ const fn fuzzy_distance(found: &SearchMatch) -> Option<u32> {
     return None;
   };
   Some(*distance)
+}
+
+#[cfg(test)]
+mod tests {
+  #![allow(clippy::unwrap_used)]
+
+  use super::*;
+
+  #[test]
+  fn string_groups_compact_repeated_groups() {
+    let groups = StringGroups::from_groups(vec![
+      vec![String::from("person")],
+      vec![String::from("person")],
+      vec![String::from("address"), String::from("location")],
+      vec![String::from("person")],
+    ]);
+
+    assert!(groups.groups.is_empty());
+    assert_eq!(groups.group_table.len(), 2);
+    assert_eq!(groups.group_refs, vec![0, 0, 1, 0]);
+    assert_eq!(
+      groups.get(2).unwrap().to_strings(),
+      vec![String::from("address"), String::from("location")]
+    );
+    assert_eq!(
+      groups
+        .iter()
+        .map(StringGroup::to_strings)
+        .collect::<Vec<_>>(),
+      vec![
+        vec![String::from("person")],
+        vec![String::from("person")],
+        vec![String::from("address"), String::from("location")],
+        vec![String::from("person")],
+      ]
+    );
+    assert!(groups.validate("test").is_ok());
+  }
+
+  #[test]
+  fn string_groups_reject_invalid_compact_reference() {
+    let groups = StringGroups {
+      table: vec![String::from("person")],
+      groups: Vec::new(),
+      group_table: vec![StringGroupIndexes::from_vec(vec![0])],
+      group_refs: vec![1],
+      empty_len: 0,
+    };
+
+    assert!(matches!(
+      groups.validate("test"),
+      Err(Error::InvalidStaticData { field: "test", .. })
+    ));
+  }
+
+  #[test]
+  fn string_groups_empty_groups_store_only_length() {
+    let groups = StringGroups::empty_groups(4);
+
+    assert_eq!(groups.len(), 4);
+    assert!(groups.table.is_empty());
+    assert!(groups.groups.is_empty());
+    assert!(groups.group_table.is_empty());
+    assert!(groups.group_refs.is_empty());
+    assert_eq!(groups.get(0).unwrap().to_strings(), Vec::<String>::new());
+    assert_eq!(groups.get(3).unwrap().to_strings(), Vec::<String>::new());
+    assert!(groups.get(4).is_none());
+    assert!(groups.validate("test").is_ok());
+  }
 }

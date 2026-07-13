@@ -27,7 +27,6 @@ impl DetectionSource {
 #[derive(
   Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize,
 )]
-#[serde(rename_all = "kebab-case")]
 pub enum SourceDetail {
   CustomDenyList,
   CustomRegex,

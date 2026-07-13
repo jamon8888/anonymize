@@ -3,11 +3,14 @@
   "globalDependencies": [".oxfmtrc.json"],
   "tasks": {
     "build": {
+      "dependsOn": ["^build"],
       "outputs": [
         "dist/**",
         "wasm/dist/**",
+        "native-wasm-dist/**",
         "stella_anonymize_napi.node",
-        "native-pipeline.stlanonpkg"
+        "native-pipeline.stlanonpkg",
+        "native-pipeline.*.stlanonpkg"
       ]
     },
     "typecheck": {

@@ -5,31 +5,46 @@ use serde::{Deserialize, Serialize};
 use stella_anonymize_core::{
   AddressContextData, AddressSeedData, AmountWordsData, CoreferenceData,
   CoreferencePatternData, CountryMatchData, CurrencyData, DateData,
-  DenyListFilterData, DenyListMatchData, DetectionSource, DiagnosticEvent,
-  DiagnosticEventKind, DiagnosticStage, FuzzySearchOptions, GazetteerMatchData,
+  DenyListFilterData, DenyListMatchData, DenyListPatternMetaSet,
+  DetectionSource, DiagnosticEvent, DiagnosticEventKind, DiagnosticPhase,
+  DiagnosticScope, DiagnosticStage, FuzzySearchOptions, GazetteerMatchData,
   HotwordRule, HotwordRuleData, LegalFormData, LiteralSearchOptions,
-  MagnitudeSuffixData, MonetaryData, NameCorpusData, OperatorConfig,
-  OperatorType, PatternSlice, PreparedSearchConfig, PreparedSearchSlices,
-  RegexMatchMeta, RegexSearchOptions, SearchEngine, SearchOptions,
-  SearchPattern, ShareQuantityTermData, SigningPlaceGuardData, SourceDetail,
-  StaticRedactionDiagnosticResult, StaticRedactionDiagnostics,
-  StaticRedactionResult, StringGroups, TriggerData, TriggerRule,
+  MagnitudeSuffixData, MonetaryData, NameCorpusData, NameCorpusMode,
+  OperatorConfig, OperatorType, PatternSlice, PipelineEntity,
+  PreparedArtifactPolicy, PreparedEngineArtifacts, PreparedEngineConfig,
+  PreparedEngineDetectorConfig, PreparedEnginePolicyConfig,
+  PreparedEngineSearchConfig, PreparedEngineSlices, RedactionResult,
+  RegexArtifactPolicy, RegexMatchMeta, RegexSearchOptions, SearchEngine,
+  SearchOptions, SearchPattern, ShareQuantityTermData, SignatureData,
+  SigningPlaceGuardData, SourceDetail, StaticRedactionDiagnosticResult,
+  StaticRedactionDiagnostics, StaticRedactionResult,
+  StaticRedactionStreamEvent, StringGroups, TriggerData, TriggerRule,
   TriggerStrategy, TriggerValidation, WrittenAmountPatternData, ZoneData,
   ZonePatternData, ZoneSigningClauseData,
+};
+
+mod assemble;
+pub use assemble::{
+  FIELDS_IMPLEMENTED, FIELDS_PENDING, assemble_static_search_config,
 };
 
 pub type Result<T> = std::result::Result<T, ContractError>;
 
 const PREPARED_SEARCH_PACKAGE_HEADER: [u8; 8] = *b"ANONPKG1";
-const PREPARED_SEARCH_PACKAGE_VERSION: u32 = 11;
+const PREPARED_SEARCH_PACKAGE_VERSION: u32 = 15;
 const PREPARED_SEARCH_COMPRESSED_PACKAGE_HEADER: [u8; 8] = *b"ANONPKZ1";
-const PREPARED_SEARCH_COMPRESSED_PACKAGE_VERSION: u32 = 9;
+const PREPARED_SEARCH_COMPRESSED_PACKAGE_VERSION: u32 = 14;
+const PREPARED_SEARCH_COMPRESSED_PACKAGE_ZSTD_VERSION: u32 = 13;
+const PREPARED_SEARCH_COMPRESSED_PACKAGE_PAYLOAD_DIGEST_VERSION: u32 = 12;
 const PREPARED_SEARCH_CORE_PACKAGE_HEADER: [u8; 8] = *b"ANONCPK1";
-const PREPARED_SEARCH_CORE_PACKAGE_VERSION: u32 = 10;
+const PREPARED_SEARCH_CORE_PACKAGE_VERSION: u32 = 20;
 const PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_HEADER: [u8; 8] = *b"ANONCPZ1";
-const PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_VERSION: u32 = 10;
+const PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_VERSION: u32 = 22;
+const PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_ZSTD_VERSION: u32 = 21;
+const PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_PAYLOAD_DIGEST_VERSION: u32 = 16;
 const PREPARED_SEARCH_PACKAGE_DIGEST_BYTES: usize = 32;
-const PREPARED_SEARCH_PACKAGE_ZSTD_LEVEL: i32 = 3;
+#[cfg(test)]
+const PREPARED_SEARCH_PACKAGE_ZSTD_LEVEL: i32 = 1;
 const MAX_PREPARED_SEARCH_PACKAGE_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +116,8 @@ pub struct BindingSearchPattern {
   pub prefilter_any: Option<Vec<String>>,
   pub prefilter_case_insensitive: Option<bool>,
   pub prefilter_regex: Option<String>,
+  pub prefilter_window_bytes: Option<u32>,
+  pub prepared_artifact_policy: Option<BindingPreparedArtifactPolicy>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -109,9 +126,24 @@ pub struct BindingSearchOptions {
   pub literal_whole_words: Option<bool>,
   pub regex_whole_words: Option<bool>,
   pub regex_overlap_all: Option<bool>,
+  pub regex_artifact_policy: Option<BindingRegexArtifactPolicy>,
   pub fuzzy_case_insensitive: Option<bool>,
   pub fuzzy_whole_words: Option<bool>,
   pub fuzzy_normalize_diacritics: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingRegexArtifactPolicy {
+  Include,
+  Omit,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingPreparedArtifactPolicy {
+  Include,
+  Omit,
 }
 
 #[derive(
@@ -190,6 +222,28 @@ pub struct BindingTriggerData {
   pub post_nominals: Vec<String>,
   #[serde(default)]
   pub sentence_terminal_currency_terms: Vec<String>,
+  #[serde(default)]
+  pub phone_extension_labels: Vec<String>,
+  #[serde(default)]
+  pub number_markers: Vec<String>,
+  #[serde(default)]
+  pub number_labels: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BindingSignatureData {
+  #[serde(default)]
+  pub labels: Vec<String>,
+  #[serde(default)]
+  pub witness_phrases: Vec<String>,
+  #[serde(default)]
+  pub name_particles: Vec<String>,
+  #[serde(default)]
+  pub post_nominal_suffixes: Vec<String>,
+  #[serde(default)]
+  pub organization_suffixes: Vec<String>,
+  #[serde(default)]
+  pub image_stub_prefixes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -396,6 +450,8 @@ pub struct BindingCoreferenceData {
   #[serde(default)]
   pub legal_form_aliases: Vec<String>,
   #[serde(default)]
+  pub organization_suffixes: Vec<String>,
+  #[serde(default)]
   pub organization_determiners: Vec<String>,
 }
 
@@ -553,9 +609,23 @@ pub struct BindingPreparedSearchConfig {
   #[serde(default)]
   pub name_corpus_data: Option<BindingNameCorpusData>,
   #[serde(default)]
+  pub signature_data: Option<BindingSignatureData>,
+  #[serde(default)]
+  pub name_corpus_mode: BindingNameCorpusMode,
+  #[serde(default)]
   pub date_data: Option<BindingDateData>,
   #[serde(default)]
   pub monetary_data: Option<BindingMonetaryData>,
+}
+
+#[derive(
+  Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingNameCorpusMode {
+  Full,
+  #[default]
+  Supplemental,
 }
 
 #[derive(Deserialize)]
@@ -578,14 +648,176 @@ pub struct BindingPreparedSearchPackage {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CorePreparedSearchPackage {
-  pub config: PreparedSearchConfig,
+  pub config: PreparedEngineConfig,
   pub artifacts: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CorePreparedSearchPackageView<'a> {
-  pub config: PreparedSearchConfig,
-  pub artifacts: Cow<'a, [u8]>,
+  pub config: PreparedEngineConfig,
+  pub artifacts: CorePreparedSearchPackageArtifacts<'a>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CorePreparedSearchPackageArtifacts<'a> {
+  inner: CorePreparedSearchPackageArtifactsInner<'a>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CorePreparedSearchPackageArtifactsInner<'a> {
+  Borrowed(&'a [u8]),
+  OwnedPayload {
+    payload: Vec<u8>,
+    artifacts_start: usize,
+  },
+}
+
+impl<'a> CorePreparedSearchPackageArtifacts<'a> {
+  const fn borrowed(bytes: &'a [u8]) -> Self {
+    Self {
+      inner: CorePreparedSearchPackageArtifactsInner::Borrowed(bytes),
+    }
+  }
+
+  fn owned_payload(payload: Vec<u8>, artifacts_start: usize) -> Result<Self> {
+    if payload.get(artifacts_start..).is_none() {
+      return Err(invalid_prepared_search_package("missing artifacts"));
+    }
+    Ok(Self {
+      inner: CorePreparedSearchPackageArtifactsInner::OwnedPayload {
+        payload,
+        artifacts_start,
+      },
+    })
+  }
+
+  #[must_use]
+  pub fn as_bytes(&self) -> &[u8] {
+    match &self.inner {
+      CorePreparedSearchPackageArtifactsInner::Borrowed(bytes) => bytes,
+      CorePreparedSearchPackageArtifactsInner::OwnedPayload {
+        payload,
+        artifacts_start,
+      } => payload.get(*artifacts_start..).unwrap_or_default(),
+    }
+  }
+
+  #[must_use]
+  pub fn into_owned(self) -> Vec<u8> {
+    match self.inner {
+      CorePreparedSearchPackageArtifactsInner::Borrowed(bytes) => {
+        bytes.to_vec()
+      }
+      CorePreparedSearchPackageArtifactsInner::OwnedPayload {
+        payload,
+        artifacts_start,
+      } => payload
+        .get(artifacts_start..)
+        .map_or_else(Vec::new, <[u8]>::to_vec),
+    }
+  }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedCorePreparedSearchPackage {
+  pub config: PreparedEngineConfig,
+  pub artifacts: PreparedEngineArtifacts,
+  pub package_decode_timings: PreparedSearchPackageDecodeTimings,
+  pub artifacts_decode: u64,
+  pub artifacts_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PreparedSearchPackageDecodeTimings {
+  pub verify: Option<u64>,
+  pub decompress: Option<u64>,
+  pub config_decode: Option<u64>,
+  pub config_bytes: Option<usize>,
+}
+
+#[must_use]
+pub const fn diagnostic_stage_event(
+  stage: DiagnosticStage,
+  count: Option<usize>,
+  elapsed_us: Option<u64>,
+  input_bytes: Option<usize>,
+) -> DiagnosticEvent {
+  DiagnosticEvent {
+    stage,
+    kind: DiagnosticEventKind::StageSummary,
+    count,
+    slot: None,
+    subslot: None,
+    pattern_count: None,
+    engine: None,
+    pattern: None,
+    source: None,
+    source_detail: None,
+    label: None,
+    start: None,
+    end: None,
+    text: None,
+    score: None,
+    span_valid: None,
+    elapsed_us,
+    input_bytes,
+    artifact_count: None,
+    artifact_bytes: None,
+    reason: None,
+  }
+}
+
+#[must_use]
+pub fn prepared_search_package_decode_events(
+  package_decode_elapsed: u64,
+  timings: PreparedSearchPackageDecodeTimings,
+  input_bytes_len: usize,
+) -> Vec<DiagnosticEvent> {
+  let mut events = vec![diagnostic_stage_event(
+    DiagnosticStage::PreparePackageDecode,
+    None,
+    Some(package_decode_elapsed),
+    Some(input_bytes_len),
+  )];
+  events.extend(prepared_search_package_decode_timing_events(
+    timings,
+    input_bytes_len,
+  ));
+  events
+}
+
+#[must_use]
+pub fn prepared_search_package_decode_timing_events(
+  timings: PreparedSearchPackageDecodeTimings,
+  input_bytes_len: usize,
+) -> Vec<DiagnosticEvent> {
+  let mut events = Vec::new();
+  if let Some(elapsed) = timings.verify {
+    events.push(diagnostic_stage_event(
+      DiagnosticStage::PreparePackageVerify,
+      None,
+      Some(elapsed),
+      Some(input_bytes_len),
+    ));
+  }
+  if let Some(elapsed) = timings.decompress {
+    events.push(diagnostic_stage_event(
+      DiagnosticStage::PreparePackageDecompress,
+      None,
+      Some(elapsed),
+      Some(input_bytes_len),
+    ));
+  }
+  if let Some(elapsed) = timings.config_decode {
+    let input_bytes = timings.config_bytes.unwrap_or(input_bytes_len);
+    events.push(diagnostic_stage_event(
+      DiagnosticStage::PreparePackageConfigDecode,
+      None,
+      Some(elapsed),
+      Some(input_bytes),
+    ));
+  }
+  events
 }
 
 #[derive(Deserialize, Serialize)]
@@ -615,6 +847,8 @@ struct BinaryPreparedSearchConfig {
   address_context_data: Option<BindingAddressContextData>,
   coreference_data: Option<BindingCoreferenceData>,
   name_corpus_data: Option<BindingNameCorpusData>,
+  signature_data: Option<BindingSignatureData>,
+  name_corpus_mode: BindingNameCorpusMode,
   date_data: Option<BindingDateData>,
   monetary_data: Option<BindingMonetaryData>,
 }
@@ -627,6 +861,12 @@ struct BinaryTriggerData {
   #[serde(default)]
   post_nominals: Vec<String>,
   sentence_terminal_currency_terms: Vec<String>,
+  #[serde(default)]
+  phone_extension_labels: Vec<String>,
+  #[serde(default)]
+  number_markers: Vec<String>,
+  #[serde(default)]
+  number_labels: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -703,7 +943,7 @@ pub fn prepared_search_package_to_compressed_bytes(
 }
 
 pub fn prepared_search_core_package_to_bytes(
-  config: &PreparedSearchConfig,
+  config: &PreparedEngineConfig,
   artifacts: &[u8],
 ) -> Result<Vec<u8>> {
   let payload =
@@ -716,7 +956,7 @@ pub fn prepared_search_core_package_to_bytes(
 }
 
 pub fn prepared_search_core_package_to_compressed_bytes(
-  config: &PreparedSearchConfig,
+  config: &PreparedEngineConfig,
   artifacts: &[u8],
 ) -> Result<Vec<u8>> {
   let payload =
@@ -739,11 +979,15 @@ pub fn prepared_search_package_has_core_payload(bytes: &[u8]) -> bool {
 }
 
 pub fn prepared_search_package_digest(bytes: &[u8]) -> Result<[u8; 32]> {
-  let parts = prepared_search_package_parts(bytes)?;
-  let digest = parts.digest();
-  let payload = parts.into_payload()?;
-  verify_prepared_search_package_digest(digest, payload.as_ref())?;
-  Ok(digest)
+  Ok(prepared_search_package_parts(bytes)?.digest())
+}
+
+pub fn prepared_search_package_verify_digest_with_timings(
+  bytes: &[u8],
+) -> Result<PreparedSearchPackageDecodeTimings> {
+  let mut timings = PreparedSearchPackageDecodeTimings::default();
+  prepared_search_package_parts(bytes)?.verify_digest(&mut timings)?;
+  Ok(timings)
 }
 
 pub fn prepared_search_package_from_bytes(
@@ -755,9 +999,8 @@ pub fn prepared_search_package_from_bytes(
       "package does not contain a binding payload",
     ));
   }
-  let digest = parts.digest();
-  let payload = parts.into_payload()?;
-  verify_prepared_search_package_digest(digest, payload.as_ref())?;
+  let mut timings = PreparedSearchPackageDecodeTimings::default();
+  let payload = parts.into_verified_payload(&mut timings)?;
   let (package, read) = bincode::serde::decode_from_slice::<
     BinaryPreparedSearchPackageOwned,
     _,
@@ -785,16 +1028,96 @@ pub fn prepared_search_core_package_from_bytes(
 pub fn prepared_search_core_package_view_from_bytes(
   bytes: &[u8],
 ) -> Result<CorePreparedSearchPackageView<'_>> {
+  Ok(prepared_search_core_package_view_from_bytes_with_timings(bytes)?.0)
+}
+
+pub fn prepared_search_core_package_view_from_bytes_with_timings(
+  bytes: &[u8],
+) -> Result<(
+  CorePreparedSearchPackageView<'_>,
+  PreparedSearchPackageDecodeTimings,
+)> {
+  prepared_search_core_package_view_from_bytes_with_policy(
+    bytes,
+    PackageDigestPolicy::Verify,
+  )
+}
+
+pub fn prepared_search_core_package_view_trusted_from_bytes_with_timings(
+  bytes: &[u8],
+) -> Result<(
+  CorePreparedSearchPackageView<'_>,
+  PreparedSearchPackageDecodeTimings,
+)> {
+  prepared_search_core_package_view_from_bytes_with_policy(
+    bytes,
+    PackageDigestPolicy::Trust,
+  )
+}
+
+fn prepared_search_core_package_view_from_bytes_with_policy(
+  bytes: &[u8],
+  digest_policy: PackageDigestPolicy,
+) -> Result<(
+  CorePreparedSearchPackageView<'_>,
+  PreparedSearchPackageDecodeTimings,
+)> {
+  let mut timings = PreparedSearchPackageDecodeTimings::default();
   let parts = prepared_search_package_parts(bytes)?;
   if !parts.is_core() {
     return Err(invalid_prepared_search_package(
       "package does not contain a core payload",
     ));
   }
-  let digest = parts.digest();
-  let payload = parts.into_payload()?;
-  verify_prepared_search_package_digest(digest, payload.as_ref())?;
-  core_package_view_from_payload(payload)
+  let payload = parts.into_payload(&mut timings, digest_policy)?;
+  let package = core_package_view_from_payload(payload, &mut timings)?;
+  Ok((package, timings))
+}
+
+pub fn prepared_search_core_package_decode_from_bytes_with_timings(
+  bytes: &[u8],
+) -> Result<DecodedCorePreparedSearchPackage> {
+  prepared_search_core_package_decode_from_bytes_with_policy(
+    bytes,
+    PackageDigestPolicy::Verify,
+  )
+}
+
+pub fn prepared_search_core_package_decode_trusted_from_bytes_with_timings(
+  bytes: &[u8],
+) -> Result<DecodedCorePreparedSearchPackage> {
+  prepared_search_core_package_decode_from_bytes_with_policy(
+    bytes,
+    PackageDigestPolicy::Trust,
+  )
+}
+
+fn prepared_search_core_package_decode_from_bytes_with_policy(
+  bytes: &[u8],
+  digest_policy: PackageDigestPolicy,
+) -> Result<DecodedCorePreparedSearchPackage> {
+  let mut package_decode_timings =
+    PreparedSearchPackageDecodeTimings::default();
+  let parts = prepared_search_package_parts(bytes)?;
+  if !parts.is_core() {
+    return Err(invalid_prepared_search_package(
+      "package does not contain a core payload",
+    ));
+  }
+  let payload =
+    parts.into_payload(&mut package_decode_timings, digest_policy)?;
+  let slices = core_package_payload_slices(payload.as_ref())?;
+  package_decode_timings.config_bytes = Some(slices.config.len());
+  let (config, config_decode, artifacts, artifacts_decode) =
+    decode_core_package_parts(slices.config, slices.artifacts)?;
+  package_decode_timings.config_decode = Some(config_decode);
+  Ok(DecodedCorePreparedSearchPackage {
+    config,
+    artifacts,
+    package_decode_timings,
+    artifacts_decode,
+    artifacts_bytes: slices.artifacts.len(),
+  })
 }
 
 impl From<BindingPreparedSearchConfig> for BinaryPreparedSearchConfig {
@@ -826,6 +1149,8 @@ impl From<BindingPreparedSearchConfig> for BinaryPreparedSearchConfig {
       address_context_data: config.address_context_data,
       coreference_data: config.coreference_data,
       name_corpus_data: config.name_corpus_data,
+      signature_data: config.signature_data,
+      name_corpus_mode: config.name_corpus_mode,
       date_data: config.date_data,
       monetary_data: config.monetary_data,
     }
@@ -861,6 +1186,8 @@ impl From<BinaryPreparedSearchConfig> for BindingPreparedSearchConfig {
       address_context_data: config.address_context_data,
       coreference_data: config.coreference_data,
       name_corpus_data: config.name_corpus_data,
+      signature_data: config.signature_data,
+      name_corpus_mode: config.name_corpus_mode,
       date_data: config.date_data,
       monetary_data: config.monetary_data,
     }
@@ -879,6 +1206,9 @@ impl From<BindingTriggerData> for BinaryTriggerData {
       party_position_terms: data.party_position_terms,
       post_nominals: data.post_nominals,
       sentence_terminal_currency_terms: data.sentence_terminal_currency_terms,
+      phone_extension_labels: data.phone_extension_labels,
+      number_markers: data.number_markers,
+      number_labels: data.number_labels,
     }
   }
 }
@@ -895,6 +1225,9 @@ impl From<BinaryTriggerData> for BindingTriggerData {
       party_position_terms: data.party_position_terms,
       post_nominals: data.post_nominals,
       sentence_terminal_currency_terms: data.sentence_terminal_currency_terms,
+      phone_extension_labels: data.phone_extension_labels,
+      number_markers: data.number_markers,
+      number_labels: data.number_labels,
     }
   }
 }
@@ -1028,13 +1361,11 @@ fn prepared_search_package_payload_to_bytes(
 }
 
 fn prepared_search_core_package_payload_to_bytes(
-  config: &PreparedSearchConfig,
+  config: &PreparedEngineConfig,
   artifacts: &[u8],
 ) -> Result<Vec<u8>> {
   let mut config = config.clone();
-  if core_literal_patterns_are_identity_mapped(&config) {
-    config.literal_patterns.clear();
-  }
+  compact_core_package_config(&mut config);
   let config_bytes =
     bincode::serde::encode_to_vec(config, package_bincode_config())
       .map_err(|error| invalid_prepared_search_package(error.to_string()))?;
@@ -1052,11 +1383,53 @@ fn prepared_search_core_package_payload_to_bytes(
   Ok(bytes)
 }
 
-fn core_package_view_from_payload(
-  payload: Cow<'_, [u8]>,
-) -> Result<CorePreparedSearchPackageView<'_>> {
+fn compact_core_package_config(config: &mut PreparedEngineConfig) {
+  if core_literal_patterns_are_identity_mapped(config) {
+    config.search.literal_patterns.clear();
+  }
+  if let Some(data) = &mut config.detectors.deny_list_data {
+    data.compact_runtime_patterns();
+  }
+}
+
+fn core_package_view_from_payload<'a>(
+  payload: Cow<'a, [u8]>,
+  timings: &mut PreparedSearchPackageDecodeTimings,
+) -> Result<CorePreparedSearchPackageView<'a>> {
+  let (config, config_decode, artifacts_start) = {
+    let payload_slices = core_package_payload_slices(payload.as_ref())?;
+    timings.config_bytes = Some(payload_slices.config.len());
+    let (config, config_decode) =
+      decode_core_package_config(payload_slices.config)?;
+    (config, config_decode, payload_slices.artifacts_start)
+  };
+  timings.config_decode = Some(config_decode);
+
+  let artifacts = match payload {
+    Cow::Borrowed(bytes) => CorePreparedSearchPackageArtifacts::borrowed(
+      bytes
+        .get(artifacts_start..)
+        .ok_or_else(|| invalid_prepared_search_package("missing artifacts"))?,
+    ),
+    Cow::Owned(bytes) => {
+      CorePreparedSearchPackageArtifacts::owned_payload(bytes, artifacts_start)?
+    }
+  };
+
+  Ok(CorePreparedSearchPackageView { config, artifacts })
+}
+
+struct CorePackagePayloadSlices<'a> {
+  config: &'a [u8],
+  artifacts: &'a [u8],
+  artifacts_start: usize,
+}
+
+fn core_package_payload_slices(
+  payload: &[u8],
+) -> Result<CorePackagePayloadSlices<'_>> {
   let len_end = std::mem::size_of::<u64>();
-  let len_bytes = payload.as_ref().get(..len_end).ok_or_else(|| {
+  let len_bytes = payload.get(..len_end).ok_or_else(|| {
     invalid_prepared_search_package("truncated config length")
   })?;
   let len_array = <[u8; 8]>::try_from(len_bytes)
@@ -1066,41 +1439,74 @@ fn core_package_view_from_payload(
   let config_end = len_end
     .checked_add(config_len)
     .ok_or_else(|| invalid_prepared_search_package("config length overflow"))?;
-  let config_bytes = payload
-    .as_ref()
+  let config = payload
     .get(len_end..config_end)
     .ok_or_else(|| invalid_prepared_search_package("truncated config"))?;
+  let artifacts = payload
+    .get(config_end..)
+    .ok_or_else(|| invalid_prepared_search_package("missing artifacts"))?;
+  Ok(CorePackagePayloadSlices {
+    config,
+    artifacts,
+    artifacts_start: config_end,
+  })
+}
+
+fn decode_core_package_parts(
+  config_bytes: &[u8],
+  artifacts_bytes: &[u8],
+) -> Result<(PreparedEngineConfig, u64, PreparedEngineArtifacts, u64)> {
+  stella_anonymize_core::exec::scope(|scope| {
+    let config_handle =
+      scope.spawn(|| decode_core_package_config(config_bytes));
+    let artifacts_handle =
+      scope.spawn(|| decode_core_package_artifacts(artifacts_bytes));
+    let (config, config_decode) = join_core_package_decode(config_handle)?;
+    let (artifacts, artifacts_decode) =
+      join_core_package_decode(artifacts_handle)?;
+    Ok((config, config_decode, artifacts, artifacts_decode))
+  })
+}
+
+fn decode_core_package_config(
+  config_bytes: &[u8],
+) -> Result<(PreparedEngineConfig, u64)> {
+  let config_decode_start = std::time::Instant::now();
   let (config, read) = bincode::serde::decode_from_slice::<
-    PreparedSearchConfig,
+    PreparedEngineConfig,
     _,
   >(config_bytes, package_bincode_config())
   .map_err(|error| invalid_prepared_search_package(error.to_string()))?;
+  let elapsed = elapsed_us(config_decode_start);
   if read != config_bytes.len() {
     return Err(invalid_prepared_search_package("trailing config data"));
   }
+  Ok((config, elapsed))
+}
 
-  let artifacts = match payload {
-    Cow::Borrowed(bytes) => Cow::Borrowed(
-      bytes
-        .get(config_end..)
-        .ok_or_else(|| invalid_prepared_search_package("missing artifacts"))?,
-    ),
-    Cow::Owned(bytes) => Cow::Owned(
-      bytes
-        .get(config_end..)
-        .ok_or_else(|| invalid_prepared_search_package("missing artifacts"))?
-        .to_vec(),
-    ),
-  };
+fn decode_core_package_artifacts(
+  artifacts_bytes: &[u8],
+) -> Result<(PreparedEngineArtifacts, u64)> {
+  let artifacts_decode_start = std::time::Instant::now();
+  let artifacts = PreparedEngineArtifacts::from_bytes(artifacts_bytes)
+    .map_err(|error| invalid_prepared_search_package(error.to_string()))?;
+  Ok((artifacts, elapsed_us(artifacts_decode_start)))
+}
 
-  Ok(CorePreparedSearchPackageView { config, artifacts })
+fn join_core_package_decode<T>(
+  handle: stella_anonymize_core::exec::JoinHandle<'_, Result<T>>,
+) -> Result<T> {
+  handle.join().map_err(|_| {
+    invalid_prepared_search_package("core package decode panicked")
+  })?
 }
 
 fn core_literal_patterns_are_identity_mapped(
-  config: &PreparedSearchConfig,
+  config: &PreparedEngineConfig,
 ) -> bool {
-  !config.literal_patterns.is_empty()
+  !config.search.literal_patterns.is_empty()
     && config
+      .search
       .literal_patterns
       .iter()
       .all(|pattern| matches!(pattern, SearchPattern::Literal(_)))
@@ -1123,10 +1529,8 @@ fn prepared_search_package_compress_payload(
   version: u32,
   payload: &[u8],
 ) -> Result<Vec<u8>> {
-  let compressed =
-    zstd::bulk::compress(payload, PREPARED_SEARCH_PACKAGE_ZSTD_LEVEL)
-      .map_err(|error| invalid_prepared_search_package(error.to_string()))?;
-  let digest = blake3::hash(payload);
+  let compressed = lz4_flex::block::compress(payload);
+  let digest = blake3::hash(&compressed);
   let mut bytes = Vec::with_capacity(
     raw_package_header_len(&compressed)
       .saturating_add(std::mem::size_of::<u64>()),
@@ -1203,11 +1607,33 @@ pub struct BindingStaticRedactionResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BindingStaticRedactionStreamEvent {
+  DetectedEntities {
+    entities: Vec<BindingPipelineEntity>,
+  },
+  ResolvedEntities {
+    entities: Vec<BindingPipelineEntity>,
+  },
+  Redacted {
+    redaction: BindingRedactionResult,
+  },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BindingDiagnosticEvent {
+  pub phase: String,
+  pub scope: String,
   pub stage: String,
   pub kind: String,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub count: Option<usize>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub slot: Option<usize>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub subslot: Option<usize>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub pattern_count: Option<usize>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub engine: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -1233,6 +1659,10 @@ pub struct BindingDiagnosticEvent {
   #[serde(skip_serializing_if = "Option::is_none")]
   pub input_bytes: Option<usize>,
   #[serde(skip_serializing_if = "Option::is_none")]
+  pub artifact_count: Option<usize>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub artifact_bytes: Option<usize>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub reason: Option<String>,
 }
 
@@ -1249,7 +1679,7 @@ pub struct BindingStaticRedactionDiagnosticResult {
 
 pub fn prepared_search_config_from_binding(
   config: BindingPreparedSearchConfig,
-) -> Result<PreparedSearchConfig> {
+) -> Result<PreparedEngineConfig> {
   let deny_list_data = config.deny_list_data;
   let literal_patterns = literal_patterns_from_binding(
     config.literal_patterns,
@@ -1277,66 +1707,73 @@ pub fn prepared_search_config_from_binding(
   let legal_form_suffixes = legal_form_data
     .as_ref()
     .map_or_else(Vec::new, |data| data.suffixes.clone());
-  Ok(PreparedSearchConfig {
-    regex_patterns: search_patterns_from_binding(config.regex_patterns)?,
-    custom_regex_patterns: search_patterns_from_binding(
-      config.custom_regex_patterns,
-    )?,
-    literal_patterns,
-    regex_options: search_options_from_binding(config.regex_options),
-    custom_regex_options: search_options_from_binding(
-      config.custom_regex_options,
-    ),
-    literal_options: search_options_from_binding(config.literal_options),
-    allowed_labels: config.allowed_labels,
-    threshold: config.threshold,
-    confidence_boost: config.confidence_boost,
-    slices: slices_from_binding(&config.slices),
-    regex_meta: regex_meta_from_binding(config.regex_meta)?,
-    custom_regex_meta: regex_meta_from_binding(config.custom_regex_meta)?,
-    deny_list_data: deny_list_data
-      .map(deny_list_data_from_binding)
-      .transpose()?,
-    false_positive_filters: config
-      .false_positive_filters
-      .map(deny_list_filters_from_binding),
-    gazetteer_data: config.gazetteer_data.map(|data| GazetteerMatchData {
-      labels: data.labels,
-      is_fuzzy: data.is_fuzzy,
-    }),
-    country_data: config.country_data.map(|data| CountryMatchData {
-      labels: data.labels,
-    }),
-    hotword_data: config.hotword_data.map(hotword_data_from_binding),
-    trigger_data: config
-      .trigger_data
-      .map(|data| trigger_data_from_binding(data, legal_form_suffixes)),
-    legal_form_data,
-    address_seed_data: config.address_seed_data.map(|data| AddressSeedData {
-      boundary_words: data.boundary_words,
-      br_cep_cue_words: data.br_cep_cue_words,
-      unit_abbreviations: data.unit_abbreviations,
-    }),
-    zone_data: config.zone_data.map(zone_data_from_binding),
-    address_context_data: config.address_context_data.map(|data| {
-      AddressContextData {
-        address_prepositions: data.address_prepositions,
-        temporal_prepositions: data.temporal_prepositions,
-        street_abbreviations: data.street_abbreviations,
-        bare_house_stopwords: data.bare_house_stopwords,
-      }
-    }),
-    coreference_data: config
-      .coreference_data
-      .map(coreference_data_from_binding),
-    name_corpus_data: config
-      .name_corpus_data
-      .map(name_corpus_data_from_binding),
-    date_data: config.date_data.map(|data| DateData {
-      month_names_by_language: data.month_names_by_language,
-      year_words_by_language: data.year_words_by_language,
-    }),
-    monetary_data: config.monetary_data.map(monetary_data_from_binding),
+  Ok(PreparedEngineConfig {
+    search: PreparedEngineSearchConfig {
+      regex_patterns: search_patterns_from_binding(config.regex_patterns)?,
+      custom_regex_patterns: search_patterns_from_binding(
+        config.custom_regex_patterns,
+      )?,
+      literal_patterns,
+      regex_options: search_options_from_binding(config.regex_options),
+      custom_regex_options: search_options_from_binding(
+        config.custom_regex_options,
+      ),
+      literal_options: search_options_from_binding(config.literal_options),
+      slices: slices_from_binding(&config.slices),
+      regex_meta: regex_meta_from_binding(config.regex_meta)?,
+      custom_regex_meta: regex_meta_from_binding(config.custom_regex_meta)?,
+    },
+    policy: PreparedEnginePolicyConfig {
+      allowed_labels: config.allowed_labels,
+      threshold: config.threshold,
+      confidence_boost: config.confidence_boost,
+    },
+    detectors: PreparedEngineDetectorConfig {
+      deny_list_data: deny_list_data
+        .map(deny_list_data_from_binding)
+        .transpose()?,
+      false_positive_filters: config
+        .false_positive_filters
+        .map(deny_list_filters_from_binding),
+      gazetteer_data: config.gazetteer_data.map(|data| GazetteerMatchData {
+        labels: data.labels,
+        is_fuzzy: data.is_fuzzy,
+      }),
+      country_data: config.country_data.map(|data| CountryMatchData {
+        labels: data.labels,
+      }),
+      hotword_data: config.hotword_data.map(hotword_data_from_binding),
+      trigger_data: config
+        .trigger_data
+        .map(|data| trigger_data_from_binding(data, legal_form_suffixes)),
+      legal_form_data,
+      address_seed_data: config.address_seed_data.map(|data| AddressSeedData {
+        boundary_words: data.boundary_words,
+        br_cep_cue_words: data.br_cep_cue_words,
+        unit_abbreviations: data.unit_abbreviations,
+      }),
+      zone_data: config.zone_data.map(zone_data_from_binding),
+      address_context_data: config.address_context_data.map(|data| {
+        AddressContextData {
+          address_prepositions: data.address_prepositions,
+          temporal_prepositions: data.temporal_prepositions,
+          street_abbreviations: data.street_abbreviations,
+          bare_house_stopwords: data.bare_house_stopwords,
+        }
+      }),
+      coreference_data: config
+        .coreference_data
+        .map(coreference_data_from_binding),
+      name_corpus_data: config.name_corpus_data.map(|data| {
+        name_corpus_data_from_binding(data, config.name_corpus_mode)
+      }),
+      signature_data: config.signature_data.map(signature_data_from_binding),
+      date_data: config.date_data.map(|data| DateData {
+        month_names_by_language: data.month_names_by_language,
+        year_words_by_language: data.year_words_by_language,
+      }),
+      monetary_data: config.monetary_data.map(monetary_data_from_binding),
+    },
   })
 }
 
@@ -1348,10 +1785,24 @@ enum PreparedSearchPackageParts<'a> {
   },
   Compressed {
     core: bool,
+    compression: PackageCompression,
     digest: [u8; 32],
     uncompressed_len: usize,
     payload: &'a [u8],
   },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageCompression {
+  Lz4,
+  ZstdCompressed,
+  ZstdPayload,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageDigestPolicy {
+  Verify,
+  Trust,
 }
 
 impl<'a> PreparedSearchPackageParts<'a> {
@@ -1367,10 +1818,32 @@ impl<'a> PreparedSearchPackageParts<'a> {
     }
   }
 
-  fn into_payload(self) -> Result<Cow<'a, [u8]>> {
+  fn into_verified_payload(
+    self,
+    timings: &mut PreparedSearchPackageDecodeTimings,
+  ) -> Result<Cow<'a, [u8]>> {
+    self.into_payload(timings, PackageDigestPolicy::Verify)
+  }
+
+  fn into_payload(
+    self,
+    timings: &mut PreparedSearchPackageDecodeTimings,
+    digest_policy: PackageDigestPolicy,
+  ) -> Result<Cow<'a, [u8]>> {
     match self {
-      Self::Raw { payload, .. } => Ok(Cow::Borrowed(payload)),
+      Self::Raw {
+        digest, payload, ..
+      } => {
+        if digest_policy == PackageDigestPolicy::Verify {
+          let verify_start = std::time::Instant::now();
+          verify_prepared_search_package_digest(digest, payload)?;
+          timings.verify = Some(elapsed_us(verify_start));
+        }
+        Ok(Cow::Borrowed(payload))
+      }
       Self::Compressed {
+        compression,
+        digest,
         uncompressed_len,
         payload,
         ..
@@ -1380,15 +1853,178 @@ impl<'a> PreparedSearchPackageParts<'a> {
             "uncompressed payload length exceeds limit",
           ));
         }
-        zstd::bulk::decompress(payload, uncompressed_len)
-          .map(Cow::Owned)
-          .map_err(|error| invalid_prepared_search_package(error.to_string()))
+        match compression {
+          PackageCompression::Lz4 | PackageCompression::ZstdCompressed => {
+            compressed_digest_payload(
+              compression,
+              digest,
+              uncompressed_len,
+              payload,
+              timings,
+              digest_policy,
+            )
+          }
+          PackageCompression::ZstdPayload => {
+            let decompress_start = std::time::Instant::now();
+            let payload = decompress_package_payload(
+              PackageCompression::ZstdPayload,
+              payload,
+              uncompressed_len,
+            )?;
+            timings.decompress = Some(elapsed_us(decompress_start));
+            if digest_policy == PackageDigestPolicy::Verify {
+              let verify_start = std::time::Instant::now();
+              verify_prepared_search_package_digest(digest, &payload)?;
+              timings.verify = Some(elapsed_us(verify_start));
+            }
+            Ok(Cow::Owned(payload))
+          }
+        }
+      }
+    }
+  }
+
+  fn verify_digest(
+    self,
+    timings: &mut PreparedSearchPackageDecodeTimings,
+  ) -> Result<()> {
+    match self {
+      Self::Raw {
+        digest, payload, ..
+      }
+      | Self::Compressed {
+        compression:
+          PackageCompression::Lz4 | PackageCompression::ZstdCompressed,
+        digest,
+        payload,
+        ..
+      } => {
+        let verify_start = std::time::Instant::now();
+        verify_prepared_search_package_digest(digest, payload)?;
+        timings.verify = Some(elapsed_us(verify_start));
+        Ok(())
+      }
+      Self::Compressed {
+        compression: PackageCompression::ZstdPayload,
+        digest,
+        uncompressed_len,
+        payload,
+        ..
+      } => {
+        if uncompressed_len > MAX_PREPARED_SEARCH_PACKAGE_PAYLOAD_BYTES {
+          return Err(invalid_prepared_search_package(
+            "uncompressed payload length exceeds limit",
+          ));
+        }
+        let decompress_start = std::time::Instant::now();
+        let payload = decompress_zstd_payload(payload, uncompressed_len)?;
+        timings.decompress = Some(elapsed_us(decompress_start));
+        let verify_start = std::time::Instant::now();
+        verify_prepared_search_package_digest(digest, &payload)?;
+        timings.verify = Some(elapsed_us(verify_start));
+        Ok(())
       }
     }
   }
 }
 
+fn compressed_digest_payload<'a>(
+  compression: PackageCompression,
+  digest: [u8; PREPARED_SEARCH_PACKAGE_DIGEST_BYTES],
+  uncompressed_len: usize,
+  payload: &'a [u8],
+  timings: &mut PreparedSearchPackageDecodeTimings,
+  digest_policy: PackageDigestPolicy,
+) -> Result<Cow<'a, [u8]>> {
+  if digest_policy == PackageDigestPolicy::Trust {
+    let decompress_start = std::time::Instant::now();
+    let decompressed =
+      decompress_package_payload(compression, payload, uncompressed_len)?;
+    timings.decompress = Some(elapsed_us(decompress_start));
+    return Ok(Cow::Owned(decompressed));
+  }
+
+  let (verify_result, verify_elapsed, decompressed, decompress_elapsed) =
+    stella_anonymize_core::exec::scope(|scope| {
+      let verify_handle = scope.spawn(|| {
+        let verify_start = std::time::Instant::now();
+        let result = verify_prepared_search_package_digest(digest, payload);
+        (result, elapsed_us(verify_start))
+      });
+      let decompress_handle = scope.spawn(|| {
+        let decompress_start = std::time::Instant::now();
+        let result =
+          decompress_package_payload(compression, payload, uncompressed_len);
+        (result, elapsed_us(decompress_start))
+      });
+      let (verify_result, verify_elapsed) =
+        join_package_decode_thread(verify_handle)?;
+      let (decompressed, decompress_elapsed) =
+        join_package_decode_thread(decompress_handle)?;
+      Ok((
+        verify_result,
+        verify_elapsed,
+        decompressed,
+        decompress_elapsed,
+      ))
+    })?;
+  verify_result?;
+  timings.verify = Some(verify_elapsed);
+  let decompressed = decompressed.map(Cow::Owned)?;
+  timings.decompress = Some(decompress_elapsed);
+  Ok(decompressed)
+}
+
+fn decompress_package_payload(
+  compression: PackageCompression,
+  payload: &[u8],
+  uncompressed_len: usize,
+) -> Result<Vec<u8>> {
+  match compression {
+    PackageCompression::Lz4 => {
+      lz4_flex::block::decompress(payload, uncompressed_len)
+        .map_err(|error| invalid_prepared_search_package(error.to_string()))
+    }
+    PackageCompression::ZstdCompressed | PackageCompression::ZstdPayload => {
+      decompress_zstd_payload(payload, uncompressed_len)
+    }
+  }
+}
+
+/// zstd decode path. The write path always emits lz4, so zstd support is only
+/// needed to read externally produced zstd-tagged packages. It is gated behind
+/// the default `zstd` feature so wasm targets (where the zstd C library does not
+/// cross-compile) can drop it and still load the lz4 packages this crate emits.
+#[cfg(feature = "zstd")]
+fn decompress_zstd_payload(
+  payload: &[u8],
+  uncompressed_len: usize,
+) -> Result<Vec<u8>> {
+  zstd::bulk::decompress(payload, uncompressed_len)
+    .map_err(|error| invalid_prepared_search_package(error.to_string()))
+}
+
+#[cfg(not(feature = "zstd"))]
+fn decompress_zstd_payload(
+  _payload: &[u8],
+  _uncompressed_len: usize,
+) -> Result<Vec<u8>> {
+  Err(invalid_prepared_search_package(
+    "zstd-compressed prepared packages are not supported in this build",
+  ))
+}
+
+fn join_package_decode_thread<T>(
+  handle: stella_anonymize_core::exec::JoinHandle<'_, T>,
+) -> Result<T> {
+  handle.join().map_err(|_| {
+    invalid_prepared_search_package("package decode thread panicked")
+  })
+}
+
+#[derive(Clone, Copy)]
 struct RawPackageHeader<'a> {
+  version: u32,
   digest: [u8; 32],
   payload: &'a [u8],
 }
@@ -1424,63 +2060,89 @@ fn prepared_search_package_parts(
     });
   }
   if header == PREPARED_SEARCH_COMPRESSED_PACKAGE_HEADER {
-    let raw = raw_package_header(
+    let (raw, compression) = compressed_package_header(
       bytes,
       PREPARED_SEARCH_COMPRESSED_PACKAGE_VERSION,
+      PREPARED_SEARCH_COMPRESSED_PACKAGE_ZSTD_VERSION,
+      PREPARED_SEARCH_COMPRESSED_PACKAGE_PAYLOAD_DIGEST_VERSION,
       PREPARED_SEARCH_COMPRESSED_PACKAGE_HEADER.len(),
     )?;
-    let len_end = std::mem::size_of::<u64>();
-    let len_bytes = raw
-      .payload
-      .get(..len_end)
-      .ok_or_else(|| invalid_prepared_search_package("truncated length"))?;
-    let len_array = <[u8; 8]>::try_from(len_bytes)
-      .map_err(|_| invalid_prepared_search_package("malformed length"))?;
-    let uncompressed_len = usize::try_from(u64::from_le_bytes(len_array))
-      .map_err(|_| invalid_prepared_search_package("length overflow"))?;
-    let payload = raw
-      .payload
-      .get(len_end..)
-      .ok_or_else(|| invalid_prepared_search_package("missing payload"))?;
-    return Ok(PreparedSearchPackageParts::Compressed {
-      core: false,
-      digest: raw.digest,
-      uncompressed_len,
-      payload,
-    });
+    return compressed_package_parts(false, raw, compression);
   }
   if header == PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_HEADER {
-    let raw = raw_package_header(
+    let (raw, compression) = compressed_package_header(
       bytes,
       PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_VERSION,
+      PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_ZSTD_VERSION,
+      PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_PAYLOAD_DIGEST_VERSION,
       PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_HEADER.len(),
     )?;
-    let len_end = std::mem::size_of::<u64>();
-    let len_bytes = raw
-      .payload
-      .get(..len_end)
-      .ok_or_else(|| invalid_prepared_search_package("truncated length"))?;
-    let len_array = <[u8; 8]>::try_from(len_bytes)
-      .map_err(|_| invalid_prepared_search_package("malformed length"))?;
-    let uncompressed_len = usize::try_from(u64::from_le_bytes(len_array))
-      .map_err(|_| invalid_prepared_search_package("length overflow"))?;
-    let payload = raw
-      .payload
-      .get(len_end..)
-      .ok_or_else(|| invalid_prepared_search_package("missing payload"))?;
-    return Ok(PreparedSearchPackageParts::Compressed {
-      core: true,
-      digest: raw.digest,
-      uncompressed_len,
-      payload,
-    });
+    return compressed_package_parts(true, raw, compression);
   }
   Err(invalid_prepared_search_package("unexpected header"))
+}
+
+fn compressed_package_parts(
+  core: bool,
+  raw: RawPackageHeader<'_>,
+  compression: PackageCompression,
+) -> Result<PreparedSearchPackageParts<'_>> {
+  let len_end = std::mem::size_of::<u64>();
+  let len_bytes = raw
+    .payload
+    .get(..len_end)
+    .ok_or_else(|| invalid_prepared_search_package("truncated length"))?;
+  let len_array = <[u8; 8]>::try_from(len_bytes)
+    .map_err(|_| invalid_prepared_search_package("malformed length"))?;
+  let uncompressed_len = usize::try_from(u64::from_le_bytes(len_array))
+    .map_err(|_| invalid_prepared_search_package("length overflow"))?;
+  let payload = raw
+    .payload
+    .get(len_end..)
+    .ok_or_else(|| invalid_prepared_search_package("missing payload"))?;
+  Ok(PreparedSearchPackageParts::Compressed {
+    core,
+    compression,
+    digest: raw.digest,
+    uncompressed_len,
+    payload,
+  })
+}
+
+fn compressed_package_header(
+  bytes: &[u8],
+  lz4_compressed_digest_version: u32,
+  zstd_compressed_digest_version: u32,
+  payload_digest_version: u32,
+  header_len: usize,
+) -> Result<(RawPackageHeader<'_>, PackageCompression)> {
+  let raw = raw_package_header_any_version(bytes, header_len)?;
+  let compression = if raw.version == lz4_compressed_digest_version {
+    PackageCompression::Lz4
+  } else if raw.version == zstd_compressed_digest_version {
+    PackageCompression::ZstdCompressed
+  } else if raw.version == payload_digest_version {
+    PackageCompression::ZstdPayload
+  } else {
+    return Err(invalid_prepared_search_package("unsupported version"));
+  };
+  Ok((raw, compression))
 }
 
 fn raw_package_header(
   bytes: &[u8],
   expected_version: u32,
+  header_len: usize,
+) -> Result<RawPackageHeader<'_>> {
+  let raw = raw_package_header_any_version(bytes, header_len)?;
+  if raw.version != expected_version {
+    return Err(invalid_prepared_search_package("unsupported version"));
+  }
+  Ok(raw)
+}
+
+fn raw_package_header_any_version(
+  bytes: &[u8],
   header_len: usize,
 ) -> Result<RawPackageHeader<'_>> {
   let version_start = header_len;
@@ -1491,9 +2153,6 @@ fn raw_package_header(
   let version_array = <[u8; 4]>::try_from(version_bytes)
     .map_err(|_| invalid_prepared_search_package("malformed version"))?;
   let version = u32::from_le_bytes(version_array);
-  if version != expected_version {
-    return Err(invalid_prepared_search_package("unsupported version"));
-  }
   let digest_end =
     version_end.saturating_add(PREPARED_SEARCH_PACKAGE_DIGEST_BYTES);
   let digest_bytes = bytes
@@ -1505,7 +2164,11 @@ fn raw_package_header(
   let payload = bytes
     .get(digest_end..)
     .ok_or_else(|| invalid_prepared_search_package("missing payload"))?;
-  Ok(RawPackageHeader { digest, payload })
+  Ok(RawPackageHeader {
+    version,
+    digest,
+    payload,
+  })
 }
 
 fn verify_prepared_search_package_digest(
@@ -1517,6 +2180,11 @@ fn verify_prepared_search_package_digest(
     return Err(invalid_prepared_search_package("digest mismatch"));
   }
   Ok(())
+}
+
+fn elapsed_us(start: std::time::Instant) -> u64 {
+  let micros = start.elapsed().as_micros();
+  u64::try_from(micros).unwrap_or(u64::MAX)
 }
 
 fn package_bincode_config() -> impl bincode::config::Config {
@@ -1551,6 +2219,7 @@ fn deny_list_data_from_binding(
       "deny_list.custom_label_indices",
     )?,
     originals: data.originals,
+    pattern_meta: DenyListPatternMetaSet::default(),
     sources: string_groups_from_binding(
       data.sources,
       data.source_indices,
@@ -1682,14 +2351,17 @@ fn coreference_data_from_binding(
       .collect(),
     role_stop_terms: data.role_stop_terms,
     legal_form_aliases: data.legal_form_aliases,
+    organization_suffixes: data.organization_suffixes,
     organization_determiners: data.organization_determiners,
   }
 }
 
 fn name_corpus_data_from_binding(
   data: BindingNameCorpusData,
+  mode: BindingNameCorpusMode,
 ) -> NameCorpusData {
   NameCorpusData {
+    mode: name_corpus_mode_from_binding(mode),
     first_names: data.first_names,
     surnames: data.surnames,
     title_tokens: data.title_tokens,
@@ -1705,6 +2377,26 @@ fn name_corpus_data_from_binding(
     cjk_non_person_terms: data.cjk_non_person_terms,
     cjk_surname_starters: data.cjk_surname_starters,
     organization_terms: data.organization_terms,
+  }
+}
+
+fn signature_data_from_binding(data: BindingSignatureData) -> SignatureData {
+  SignatureData {
+    labels: data.labels,
+    witness_phrases: data.witness_phrases,
+    name_particles: data.name_particles,
+    post_nominal_suffixes: data.post_nominal_suffixes,
+    organization_suffixes: data.organization_suffixes,
+    image_stub_prefixes: data.image_stub_prefixes,
+  }
+}
+
+const fn name_corpus_mode_from_binding(
+  mode: BindingNameCorpusMode,
+) -> NameCorpusMode {
+  match mode {
+    BindingNameCorpusMode::Full => NameCorpusMode::Full,
+    BindingNameCorpusMode::Supplemental => NameCorpusMode::Supplemental,
   }
 }
 
@@ -1758,38 +2450,9 @@ pub fn static_redaction_result_to_binding(
     resolved_entities: result
       .resolved_entities
       .into_iter()
-      .map(|entity| BindingPipelineEntity {
-        start: entity.start,
-        end: entity.end,
-        label: entity.label,
-        text: entity.text,
-        score: entity.score,
-        source: detection_source_name(entity.source),
-        source_detail: entity.source_detail.map(source_detail_name),
-      })
+      .map(binding_pipeline_entity_from_core)
       .collect(),
-    redaction: BindingRedactionResult {
-      redacted_text: result.redaction.redacted_text,
-      redaction_map: result
-        .redaction
-        .redaction_map
-        .into_iter()
-        .map(|entry| BindingRedactionEntry {
-          placeholder: entry.placeholder,
-          original: entry.original,
-        })
-        .collect(),
-      operator_map: result
-        .redaction
-        .operator_map
-        .into_iter()
-        .map(|entry| BindingOperatorEntry {
-          placeholder: entry.placeholder,
-          operator: operator_name(entry.operator),
-        })
-        .collect(),
-      entity_count: result.redaction.entity_count,
-    },
+    redaction: binding_redaction_result_from_core(result.redaction),
   }
 }
 
@@ -1801,6 +2464,130 @@ pub fn static_redaction_result_to_utf16_binding(
   let mut result = static_redaction_result_to_binding(result);
   convert_pipeline_entity_offsets(&mut result.resolved_entities, &offsets)?;
   Ok(result)
+}
+
+#[must_use]
+pub fn static_redaction_stream_event_to_binding(
+  event: StaticRedactionStreamEvent<'_>,
+) -> BindingStaticRedactionStreamEvent {
+  match event {
+    StaticRedactionStreamEvent::DetectedEntities(detections) => {
+      BindingStaticRedactionStreamEvent::DetectedEntities {
+        entities: detections
+          .all_entities()
+          .into_iter()
+          .map(binding_pipeline_entity_from_core)
+          .collect(),
+      }
+    }
+    StaticRedactionStreamEvent::ResolvedEntities(entities) => {
+      BindingStaticRedactionStreamEvent::ResolvedEntities {
+        entities: entities
+          .iter()
+          .map(binding_pipeline_entity_from_core_ref)
+          .collect(),
+      }
+    }
+    StaticRedactionStreamEvent::Redacted(redaction) => {
+      BindingStaticRedactionStreamEvent::Redacted {
+        redaction: binding_redaction_result_from_core_ref(redaction),
+      }
+    }
+  }
+}
+
+pub fn static_redaction_stream_event_to_utf16_binding(
+  event: StaticRedactionStreamEvent<'_>,
+  full_text: &str,
+) -> Result<BindingStaticRedactionStreamEvent> {
+  let offsets = Utf16OffsetMap::new(full_text)?;
+  let mut event = static_redaction_stream_event_to_binding(event);
+  match &mut event {
+    BindingStaticRedactionStreamEvent::DetectedEntities { entities }
+    | BindingStaticRedactionStreamEvent::ResolvedEntities { entities } => {
+      convert_pipeline_entity_offsets(entities, &offsets)?;
+    }
+    BindingStaticRedactionStreamEvent::Redacted { .. } => {}
+  }
+  Ok(event)
+}
+
+fn binding_pipeline_entity_from_core(
+  entity: PipelineEntity,
+) -> BindingPipelineEntity {
+  BindingPipelineEntity {
+    start: entity.start,
+    end: entity.end,
+    label: entity.label,
+    text: entity.text,
+    score: entity.score,
+    source: detection_source_name(entity.source),
+    source_detail: entity.source_detail.map(source_detail_name),
+  }
+}
+
+fn binding_pipeline_entity_from_core_ref(
+  entity: &PipelineEntity,
+) -> BindingPipelineEntity {
+  BindingPipelineEntity {
+    start: entity.start,
+    end: entity.end,
+    label: entity.label.clone(),
+    text: entity.text.clone(),
+    score: entity.score,
+    source: detection_source_name(entity.source),
+    source_detail: entity.source_detail.map(source_detail_name),
+  }
+}
+
+fn binding_redaction_result_from_core(
+  redaction: RedactionResult,
+) -> BindingRedactionResult {
+  BindingRedactionResult {
+    redacted_text: redaction.redacted_text,
+    redaction_map: redaction
+      .redaction_map
+      .into_iter()
+      .map(|entry| BindingRedactionEntry {
+        placeholder: entry.placeholder,
+        original: entry.original,
+      })
+      .collect(),
+    operator_map: redaction
+      .operator_map
+      .into_iter()
+      .map(|entry| BindingOperatorEntry {
+        placeholder: entry.placeholder,
+        operator: operator_name(entry.operator),
+      })
+      .collect(),
+    entity_count: redaction.entity_count,
+  }
+}
+
+fn binding_redaction_result_from_core_ref(
+  redaction: &RedactionResult,
+) -> BindingRedactionResult {
+  BindingRedactionResult {
+    redacted_text: redaction.redacted_text.clone(),
+    redaction_map: redaction
+      .redaction_map
+      .iter()
+      .map(|entry| BindingRedactionEntry {
+        placeholder: entry.placeholder.clone(),
+        original: entry.original.clone(),
+      })
+      .collect(),
+    operator_map: redaction
+      .operator_map
+      .iter()
+      .map(|entry| BindingOperatorEntry {
+        placeholder: entry.placeholder.clone(),
+        operator: operator_name(entry.operator),
+      })
+      .collect(),
+    entity_count: redaction.entity_count,
+  }
 }
 
 #[must_use]
@@ -1850,13 +2637,41 @@ pub fn static_redaction_diagnostics_to_utf16_binding(
   Ok(diagnostics)
 }
 
+#[must_use]
+pub fn diagnostic_events_to_binding(
+  events: &[DiagnosticEvent],
+) -> BindingStaticRedactionDiagnostics {
+  BindingStaticRedactionDiagnostics {
+    events: events
+      .iter()
+      .cloned()
+      .map(diagnostic_event_to_binding)
+      .collect(),
+  }
+}
+
+pub fn diagnostic_events_to_utf16_binding(
+  events: &[DiagnosticEvent],
+  full_text: &str,
+) -> Result<BindingStaticRedactionDiagnostics> {
+  let offsets = Utf16OffsetMap::new(full_text)?;
+  let mut diagnostics = diagnostic_events_to_binding(events);
+  convert_diagnostic_offsets(&mut diagnostics.events, &offsets)?;
+  Ok(diagnostics)
+}
+
 fn diagnostic_event_to_binding(
   event: DiagnosticEvent,
 ) -> BindingDiagnosticEvent {
   BindingDiagnosticEvent {
+    phase: diagnostic_phase_name(event.stage.phase()),
+    scope: diagnostic_scope_name(event.scope()),
     stage: diagnostic_stage_name(event.stage),
     kind: diagnostic_event_kind_name(event.kind),
     count: event.count,
+    slot: event.slot,
+    subslot: event.subslot,
+    pattern_count: event.pattern_count,
     engine: event.engine.map(search_engine_name),
     pattern: event.pattern,
     source: event.source.map(detection_source_name),
@@ -1869,6 +2684,8 @@ fn diagnostic_event_to_binding(
     span_valid: event.span_valid,
     elapsed_us: event.elapsed_us,
     input_bytes: event.input_bytes,
+    artifact_count: event.artifact_count,
+    artifact_bytes: event.artifact_bytes,
     reason: event.reason,
   }
 }
@@ -1899,12 +2716,19 @@ fn convert_diagnostic_offsets(
   Ok(())
 }
 
-struct Utf16OffsetMap {
-  boundaries: Vec<(u32, u32)>,
+enum Utf16OffsetMap {
+  Identity { byte_len: u32 },
+  Boundaries(Vec<(u32, u32)>),
 }
 
 impl Utf16OffsetMap {
   fn new(text: &str) -> Result<Self> {
+    if text.is_ascii() {
+      return Ok(Self::Identity {
+        byte_len: u32_from_usize(text.len())?,
+      });
+    }
+
     let mut boundaries = Vec::new();
     let mut utf16_offset = 0_u32;
     boundaries.push((0, 0));
@@ -1919,7 +2743,7 @@ impl Utf16OffsetMap {
       boundaries.push((u32_from_usize(byte_end)?, utf16_offset));
     }
 
-    Ok(Self { boundaries })
+    Ok(Self::Boundaries(boundaries))
   }
 
   fn convert(&self, offset: u32) -> Result<u32> {
@@ -1929,14 +2753,15 @@ impl Utf16OffsetMap {
   }
 
   fn try_convert(&self, offset: u32) -> Option<u32> {
-    let index = self
-      .boundaries
-      .binary_search_by_key(&offset, |(byte_offset, _)| *byte_offset)
-      .ok()?;
-    self
-      .boundaries
-      .get(index)
-      .map(|(_, utf16_offset)| *utf16_offset)
+    match self {
+      Self::Identity { byte_len } => (offset <= *byte_len).then_some(offset),
+      Self::Boundaries(boundaries) => {
+        let index = boundaries
+          .binary_search_by_key(&offset, |(byte_offset, _)| *byte_offset)
+          .ok()?;
+        boundaries.get(index).map(|(_, utf16_offset)| *utf16_offset)
+      }
+    }
   }
 }
 
@@ -2005,6 +2830,9 @@ fn trigger_data_from_binding(
     legal_form_suffixes,
     post_nominals: data.post_nominals,
     sentence_terminal_currency_terms: data.sentence_terminal_currency_terms,
+    phone_extension_labels: data.phone_extension_labels,
+    number_markers: data.number_markers,
+    number_labels: data.number_labels,
   }
 }
 
@@ -2123,6 +2951,8 @@ fn search_pattern_from_binding(
         || pattern.prefilter_any.is_some()
         || pattern.prefilter_case_insensitive.is_some()
         || pattern.prefilter_regex.is_some()
+        || pattern.prefilter_window_bytes.is_some()
+        || pattern.prepared_artifact_policy.is_some()
       {
         return Ok(SearchPattern::RegexWithOptions {
           pattern: pattern.pattern,
@@ -2130,6 +2960,12 @@ fn search_pattern_from_binding(
           prefilter_any: pattern.prefilter_any.unwrap_or_default(),
           prefilter_case_insensitive: pattern.prefilter_case_insensitive,
           prefilter_regex: pattern.prefilter_regex,
+          prefilter_window_bytes: pattern
+            .prefilter_window_bytes
+            .and_then(|value| usize::try_from(value).ok()),
+          prepared_artifact_policy: pattern
+            .prepared_artifact_policy
+            .map(prepared_artifact_policy_from_binding),
         });
       }
       Ok(SearchPattern::Regex(pattern.pattern))
@@ -2150,6 +2986,15 @@ fn search_pattern_from_binding(
   }
 }
 
+const fn prepared_artifact_policy_from_binding(
+  policy: BindingPreparedArtifactPolicy,
+) -> PreparedArtifactPolicy {
+  match policy {
+    BindingPreparedArtifactPolicy::Include => PreparedArtifactPolicy::Include,
+    BindingPreparedArtifactPolicy::Omit => PreparedArtifactPolicy::Omit,
+  }
+}
+
 fn search_options_from_binding(
   options: Option<BindingSearchOptions>,
 ) -> SearchOptions {
@@ -2165,6 +3010,12 @@ fn search_options_from_binding(
     regex: RegexSearchOptions {
       whole_words: options.regex_whole_words.unwrap_or(false),
       overlap_all: options.regex_overlap_all.unwrap_or(false),
+      artifact_policy: match options.regex_artifact_policy {
+        Some(BindingRegexArtifactPolicy::Include) | None => {
+          RegexArtifactPolicy::Include
+        }
+        Some(BindingRegexArtifactPolicy::Omit) => RegexArtifactPolicy::Omit,
+      },
     },
     fuzzy: FuzzySearchOptions {
       case_insensitive: options.fuzzy_case_insensitive.unwrap_or(false),
@@ -2176,8 +3027,8 @@ fn search_options_from_binding(
 
 fn slices_from_binding(
   slices: &BindingPreparedSearchSlices,
-) -> PreparedSearchSlices {
-  PreparedSearchSlices {
+) -> PreparedEngineSlices {
+  PreparedEngineSlices {
     regex: slice_from_binding(slices.regex),
     custom_regex: slice_from_binding(slices.custom_regex),
     legal_forms: slice_from_binding(slices.legal_forms),
@@ -2275,12 +3126,134 @@ fn search_engine_name(engine: SearchEngine) -> String {
   .to_owned()
 }
 
+fn diagnostic_phase_name(phase: DiagnosticPhase) -> String {
+  match phase {
+    DiagnosticPhase::Prepare => "prepare",
+    DiagnosticPhase::Warm => "warm",
+    DiagnosticPhase::Search => "search",
+    DiagnosticPhase::Detect => "detect",
+    DiagnosticPhase::Resolve => "resolve",
+    DiagnosticPhase::Redact => "redact",
+  }
+  .to_owned()
+}
+
+fn diagnostic_scope_name(scope: DiagnosticScope) -> String {
+  match scope {
+    DiagnosticScope::Total => "total",
+    DiagnosticScope::Step => "step",
+    DiagnosticScope::Slot => "slot",
+    DiagnosticScope::Detail => "detail",
+  }
+  .to_owned()
+}
+
 fn diagnostic_stage_name(stage: DiagnosticStage) -> String {
   match stage {
+    DiagnosticStage::PrepareCacheKey
+    | DiagnosticStage::PrepareCacheBypass
+    | DiagnosticStage::PrepareCacheHit
+    | DiagnosticStage::PrepareCacheMiss
+    | DiagnosticStage::PrepareBindingParse
+    | DiagnosticStage::PreparePackageDecode
+    | DiagnosticStage::PreparePackageVerify
+    | DiagnosticStage::PreparePackageDecompress
+    | DiagnosticStage::PreparePackageConfigDecode
+    | DiagnosticStage::PrepareBindingConvert
+    | DiagnosticStage::PrepareArtifactsDecode
+    | DiagnosticStage::PrepareTotal
+    | DiagnosticStage::PrepareRegex
+    | DiagnosticStage::PrepareCustomRegex
+    | DiagnosticStage::PrepareAnchored
+    | DiagnosticStage::PrepareLegalFormSearch
+    | DiagnosticStage::PrepareTriggerSearch
+    | DiagnosticStage::PrepareLiteral
+    | DiagnosticStage::PrepareHotwordData
+    | DiagnosticStage::PrepareTriggerData
+    | DiagnosticStage::PrepareLegalFormData
+    | DiagnosticStage::PrepareAddressSeedData
+    | DiagnosticStage::PrepareZoneData
+    | DiagnosticStage::PrepareAddressContextData
+    | DiagnosticStage::PrepareCoreferenceData
+    | DiagnosticStage::PrepareNameCorpusData
+    | DiagnosticStage::PrepareSignatureData => {
+      diagnostic_prepare_stage_name(stage)
+    }
+    DiagnosticStage::WarmRegex
+    | DiagnosticStage::WarmCustomRegex
+    | DiagnosticStage::WarmLegalFormSearch
+    | DiagnosticStage::WarmTriggerSearch
+    | DiagnosticStage::WarmLiteral
+    | DiagnosticStage::WarmTotal => diagnostic_warm_stage_name(stage),
+    DiagnosticStage::Normalize
+    | DiagnosticStage::FindMatches
+    | DiagnosticStage::FindRegex
+    | DiagnosticStage::FindCustomRegex
+    | DiagnosticStage::FindLegalForm
+    | DiagnosticStage::FindTrigger
+    | DiagnosticStage::FindLiteral
+    | DiagnosticStage::SearchRegex
+    | DiagnosticStage::SearchCustomRegex
+    | DiagnosticStage::SearchLegalForm
+    | DiagnosticStage::SearchTrigger
+    | DiagnosticStage::SearchLiteral => diagnostic_search_stage_name(stage),
+    DiagnosticStage::DetectTotal
+    | DiagnosticStage::EntityRegex
+    | DiagnosticStage::EntityCustomRegex
+    | DiagnosticStage::EntityAnchored
+    | DiagnosticStage::EntityDenyList
+    | DiagnosticStage::EntityGazetteer
+    | DiagnosticStage::EntityCountry
+    | DiagnosticStage::EntityTrigger
+    | DiagnosticStage::EntitySignature
+    | DiagnosticStage::EntityLegalForm
+    | DiagnosticStage::EntityAddressSeed
+    | DiagnosticStage::EntityAddressSeedContext
+    | DiagnosticStage::EntityAddressSeedCollect
+    | DiagnosticStage::EntityAddressSeedCollectStreetTypes
+    | DiagnosticStage::EntityAddressSeedCollectExisting
+    | DiagnosticStage::EntityAddressSeedCollectStreetNumbers
+    | DiagnosticStage::EntityAddressSeedCollectPostalCodes
+    | DiagnosticStage::EntityAddressSeedCollectItalianCap
+    | DiagnosticStage::EntityAddressSeedCluster
+    | DiagnosticStage::EntityAddressSeedBoundary
+    | DiagnosticStage::EntityAddressSeedExpand
+    | DiagnosticStage::EntityNameCorpus
+    | DiagnosticStage::EntityNameCorpusCjk
+    | DiagnosticStage::EntityNameCorpusSegment
+    | DiagnosticStage::EntityNameCorpusSeed
+    | DiagnosticStage::EntityNameCorpusClassify
+    | DiagnosticStage::EntityNameCorpusChains
+    | DiagnosticStage::EntityNameCorpusDedupe
+    | DiagnosticStage::EntityNameCorpusFilter => {
+      diagnostic_detect_stage_name(stage)
+    }
+    DiagnosticStage::EntityZoneAdjustment
+    | DiagnosticStage::EntityHotword
+    | DiagnosticStage::EntityAddressContext
+    | DiagnosticStage::EntityCoreference
+    | DiagnosticStage::Merge
+    | DiagnosticStage::Boundary
+    | DiagnosticStage::Sanitize
+    | DiagnosticStage::RedactTotal
+    | DiagnosticStage::Redaction => diagnostic_finish_stage_name(stage),
+  }
+  .to_owned()
+}
+
+const fn diagnostic_prepare_stage_name(stage: DiagnosticStage) -> &'static str {
+  match stage {
+    DiagnosticStage::PrepareCacheKey => "prepare.cache-key",
+    DiagnosticStage::PrepareCacheBypass => "prepare.cache.bypass",
     DiagnosticStage::PrepareCacheHit => "prepare.cache.hit",
     DiagnosticStage::PrepareCacheMiss => "prepare.cache.miss",
     DiagnosticStage::PrepareBindingParse => "prepare.binding.parse",
     DiagnosticStage::PreparePackageDecode => "prepare.package.decode",
+    DiagnosticStage::PreparePackageVerify => "prepare.package.verify",
+    DiagnosticStage::PreparePackageDecompress => "prepare.package.decompress",
+    DiagnosticStage::PreparePackageConfigDecode => {
+      "prepare.package.config-decode"
+    }
     DiagnosticStage::PrepareBindingConvert => "prepare.binding.convert",
     DiagnosticStage::PrepareArtifactsDecode => "prepare.artifacts.decode",
     DiagnosticStage::PrepareTotal => "prepare.total",
@@ -2290,16 +3263,54 @@ fn diagnostic_stage_name(stage: DiagnosticStage) -> String {
     DiagnosticStage::PrepareLegalFormSearch => "prepare.legal-form-search",
     DiagnosticStage::PrepareTriggerSearch => "prepare.trigger-search",
     DiagnosticStage::PrepareLiteral => "prepare.literal",
+    DiagnosticStage::PrepareHotwordData => "prepare.hotword-data",
+    DiagnosticStage::PrepareTriggerData => "prepare.trigger-data",
+    DiagnosticStage::PrepareLegalFormData => "prepare.legal-form-data",
+    DiagnosticStage::PrepareAddressSeedData => "prepare.address-seed-data",
+    DiagnosticStage::PrepareZoneData => "prepare.zone-data",
+    DiagnosticStage::PrepareAddressContextData => {
+      "prepare.address-context-data"
+    }
+    DiagnosticStage::PrepareCoreferenceData => "prepare.coreference-data",
+    DiagnosticStage::PrepareNameCorpusData => "prepare.name-corpus-data",
+    DiagnosticStage::PrepareSignatureData => "prepare.signature-data",
+    _ => "prepare.unknown",
+  }
+}
+
+const fn diagnostic_warm_stage_name(stage: DiagnosticStage) -> &'static str {
+  match stage {
+    DiagnosticStage::WarmRegex => "warm.regex",
+    DiagnosticStage::WarmCustomRegex => "warm.custom-regex",
+    DiagnosticStage::WarmLegalFormSearch => "warm.legal-form-search",
+    DiagnosticStage::WarmTriggerSearch => "warm.trigger-search",
+    DiagnosticStage::WarmLiteral => "warm.literal",
+    DiagnosticStage::WarmTotal => "warm.total",
+    _ => "warm.unknown",
+  }
+}
+
+const fn diagnostic_search_stage_name(stage: DiagnosticStage) -> &'static str {
+  match stage {
     DiagnosticStage::Normalize => "normalize",
     DiagnosticStage::FindMatches => "find-matches",
     DiagnosticStage::FindRegex => "find.regex",
     DiagnosticStage::FindCustomRegex => "find.custom-regex",
+    DiagnosticStage::FindLegalForm => "find.legal-form",
+    DiagnosticStage::FindTrigger => "find.trigger",
     DiagnosticStage::FindLiteral => "find.literal",
     DiagnosticStage::SearchRegex => "search.regex",
     DiagnosticStage::SearchCustomRegex => "search.custom-regex",
     DiagnosticStage::SearchLegalForm => "search.legal-form",
     DiagnosticStage::SearchTrigger => "search.trigger",
     DiagnosticStage::SearchLiteral => "search.literal",
+    _ => "search.unknown",
+  }
+}
+
+const fn diagnostic_detect_stage_name(stage: DiagnosticStage) -> &'static str {
+  match stage {
+    DiagnosticStage::DetectTotal => "detect.total",
     DiagnosticStage::EntityRegex => "entity.regex",
     DiagnosticStage::EntityCustomRegex => "entity.custom-regex",
     DiagnosticStage::EntityAnchored => "entity.anchored",
@@ -2310,16 +3321,53 @@ fn diagnostic_stage_name(stage: DiagnosticStage) -> String {
     DiagnosticStage::EntitySignature => "entity.signature",
     DiagnosticStage::EntityLegalForm => "entity.legal-form",
     DiagnosticStage::EntityAddressSeed => "entity.address-seed",
+    DiagnosticStage::EntityAddressSeedContext => "entity.address-seed.context",
+    DiagnosticStage::EntityAddressSeedCollect => "entity.address-seed.collect",
+    DiagnosticStage::EntityAddressSeedCollectStreetTypes => {
+      "entity.address-seed.collect.street-types"
+    }
+    DiagnosticStage::EntityAddressSeedCollectExisting => {
+      "entity.address-seed.collect.existing"
+    }
+    DiagnosticStage::EntityAddressSeedCollectStreetNumbers => {
+      "entity.address-seed.collect.street-numbers"
+    }
+    DiagnosticStage::EntityAddressSeedCollectPostalCodes => {
+      "entity.address-seed.collect.postal-codes"
+    }
+    DiagnosticStage::EntityAddressSeedCollectItalianCap => {
+      "entity.address-seed.collect.italian-cap"
+    }
+    DiagnosticStage::EntityAddressSeedCluster => "entity.address-seed.cluster",
+    DiagnosticStage::EntityAddressSeedBoundary => {
+      "entity.address-seed.boundary"
+    }
+    DiagnosticStage::EntityAddressSeedExpand => "entity.address-seed.expand",
     DiagnosticStage::EntityNameCorpus => "entity.name-corpus",
+    DiagnosticStage::EntityNameCorpusCjk => "entity.name-corpus.cjk",
+    DiagnosticStage::EntityNameCorpusSegment => "entity.name-corpus.segment",
+    DiagnosticStage::EntityNameCorpusSeed => "entity.name-corpus.seed",
+    DiagnosticStage::EntityNameCorpusClassify => "entity.name-corpus.classify",
+    DiagnosticStage::EntityNameCorpusChains => "entity.name-corpus.chains",
+    DiagnosticStage::EntityNameCorpusDedupe => "entity.name-corpus.dedupe",
+    DiagnosticStage::EntityNameCorpusFilter => "entity.name-corpus.filter",
+    _ => "detect.unknown",
+  }
+}
+
+const fn diagnostic_finish_stage_name(stage: DiagnosticStage) -> &'static str {
+  match stage {
     DiagnosticStage::EntityZoneAdjustment => "entity.zone-adjustment",
+    DiagnosticStage::EntityHotword => "entity.hotword",
     DiagnosticStage::EntityAddressContext => "entity.address-context",
     DiagnosticStage::EntityCoreference => "entity.coreference",
     DiagnosticStage::Merge => "resolution.merge",
     DiagnosticStage::Boundary => "resolution.boundary",
     DiagnosticStage::Sanitize => "resolution.sanitize",
+    DiagnosticStage::RedactTotal => "redact.total",
     DiagnosticStage::Redaction => "redaction",
+    _ => "finish.unknown",
   }
-  .to_owned()
 }
 
 fn diagnostic_event_kind_name(kind: DiagnosticEventKind) -> String {
@@ -2345,26 +3393,44 @@ mod tests {
   #![allow(clippy::unwrap_used)]
 
   use super::{
-    BindingOperatorConfig, BindingPreparedSearchConfig, BindingSearchOptions,
-    BindingSearchPattern, ContractError,
+    BindingDenyListMatchData, BindingOperatorConfig,
+    BindingPreparedArtifactPolicy, BindingPreparedSearchConfig,
+    BindingRegexArtifactPolicy, BindingSearchOptions, BindingSearchPattern,
+    ContractError, CorePreparedSearchPackageArtifactsInner,
     MAX_PREPARED_SEARCH_PACKAGE_PAYLOAD_BYTES,
     PREPARED_SEARCH_COMPRESSED_PACKAGE_HEADER,
+    PREPARED_SEARCH_COMPRESSED_PACKAGE_PAYLOAD_DIGEST_VERSION,
     PREPARED_SEARCH_COMPRESSED_PACKAGE_VERSION,
+    PREPARED_SEARCH_COMPRESSED_PACKAGE_ZSTD_VERSION,
     PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_HEADER,
+    PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_PAYLOAD_DIGEST_VERSION,
     PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_VERSION,
-    PREPARED_SEARCH_PACKAGE_DIGEST_BYTES, operator_config_from_binding,
-    prepared_search_config_from_binding,
+    PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_ZSTD_VERSION,
+    PREPARED_SEARCH_PACKAGE_DIGEST_BYTES, PREPARED_SEARCH_PACKAGE_ZSTD_LEVEL,
+    PreparedSearchPackageDecodeTimings, diagnostic_events_to_binding,
+    diagnostic_events_to_utf16_binding, diagnostic_stage_event,
+    operator_config_from_binding, prepared_search_config_from_binding,
+    prepared_search_core_package_decode_from_bytes_with_timings,
+    prepared_search_core_package_decode_trusted_from_bytes_with_timings,
     prepared_search_core_package_from_bytes,
+    prepared_search_core_package_payload_to_bytes,
     prepared_search_core_package_to_bytes,
     prepared_search_core_package_to_compressed_bytes,
-    prepared_search_package_from_bytes,
-    prepared_search_package_has_core_payload, prepared_search_package_to_bytes,
+    prepared_search_core_package_view_from_bytes_with_timings,
+    prepared_search_core_package_view_trusted_from_bytes_with_timings,
+    prepared_search_package_decode_events,
+    prepared_search_package_decode_timing_events,
+    prepared_search_package_digest, prepared_search_package_from_bytes,
+    prepared_search_package_has_core_payload,
+    prepared_search_package_payload_to_bytes, prepared_search_package_to_bytes,
     prepared_search_package_to_compressed_bytes,
+    prepared_search_package_verify_digest_with_timings,
     static_redaction_diagnostics_to_utf16_binding, write_package_header,
   };
   use stella_anonymize_core::{
     DiagnosticEvent, DiagnosticEventKind, DiagnosticStage,
-    StaticRedactionDiagnostics,
+    PreparedArtifactPolicy, PreparedEngineArtifacts, RegexArtifactPolicy,
+    SearchPattern, StaticRedactionDiagnostics,
   };
 
   #[test]
@@ -2406,6 +3472,88 @@ mod tests {
   }
 
   #[test]
+  fn prepared_search_package_digest_reads_header_without_verifying_payload() {
+    let config = BindingPreparedSearchConfig::default();
+    let mut bytes =
+      prepared_search_package_to_bytes(&config, b"artifact").unwrap();
+    let digest = prepared_search_package_digest(&bytes).unwrap();
+
+    let last = bytes.last_mut().unwrap();
+    *last ^= 0x01;
+
+    assert_eq!(prepared_search_package_digest(&bytes).unwrap(), digest);
+    assert!(
+      prepared_search_package_verify_digest_with_timings(&bytes).is_err(),
+      "header digest identity must not replace payload verification"
+    );
+  }
+
+  #[test]
+  fn prepared_search_package_verify_digest_reports_timing() {
+    let config = BindingPreparedSearchConfig::default();
+    let bytes =
+      prepared_search_package_to_compressed_bytes(&config, b"artifact")
+        .unwrap();
+
+    let timings =
+      prepared_search_package_verify_digest_with_timings(&bytes).unwrap();
+
+    assert!(
+      timings.verify.is_some(),
+      "digest verification timing should be reported"
+    );
+  }
+
+  #[test]
+  fn prepared_search_package_decode_events_report_ordered_stages() {
+    let events = prepared_search_package_decode_events(
+      10,
+      PreparedSearchPackageDecodeTimings {
+        verify: Some(2),
+        decompress: None,
+        config_decode: Some(3),
+        config_bytes: Some(64),
+      },
+      128,
+    );
+
+    let stages = events.iter().map(|event| event.stage).collect::<Vec<_>>();
+
+    assert_eq!(
+      stages,
+      vec![
+        DiagnosticStage::PreparePackageDecode,
+        DiagnosticStage::PreparePackageVerify,
+        DiagnosticStage::PreparePackageConfigDecode,
+      ]
+    );
+    assert_eq!(
+      events.first().unwrap(),
+      &diagnostic_stage_event(
+        DiagnosticStage::PreparePackageDecode,
+        None,
+        Some(10),
+        Some(128),
+      )
+    );
+    assert_eq!(
+      events.last().unwrap().input_bytes,
+      Some(64),
+      "config decode should report encoded config bytes"
+    );
+  }
+
+  #[test]
+  fn prepared_search_package_decode_timing_events_skip_missing_timings() {
+    let events = prepared_search_package_decode_timing_events(
+      PreparedSearchPackageDecodeTimings::default(),
+      128,
+    );
+
+    assert!(events.is_empty());
+  }
+
+  #[test]
   fn binding_operator_config_accepts_camel_case_redact_string() {
     let config = serde_json::from_str::<BindingOperatorConfig>(
       r#"{"operators":{"country":"redact"},"redactString":"***"}"#,
@@ -2427,7 +3575,53 @@ mod tests {
     };
     let core = prepared_search_config_from_binding(config).unwrap();
 
-    assert!(core.custom_regex_options.regex.overlap_all);
+    assert!(core.search.custom_regex_options.regex.overlap_all);
+  }
+
+  #[test]
+  fn binding_search_options_accept_regex_artifact_policy() {
+    let config = BindingPreparedSearchConfig {
+      regex_options: Some(BindingSearchOptions {
+        regex_artifact_policy: Some(BindingRegexArtifactPolicy::Omit),
+        ..BindingSearchOptions::default()
+      }),
+      ..BindingPreparedSearchConfig::default()
+    };
+    let core = prepared_search_config_from_binding(config).unwrap();
+
+    assert_eq!(
+      core.search.regex_options.regex.artifact_policy,
+      RegexArtifactPolicy::Omit
+    );
+  }
+
+  #[test]
+  fn binding_regex_patterns_accept_prepared_artifact_policy() {
+    let config = BindingPreparedSearchConfig {
+      regex_patterns: vec![BindingSearchPattern {
+        kind: "regex".to_string(),
+        pattern: "SSN\\s+\\d+".to_string(),
+        distance: None,
+        case_insensitive: None,
+        whole_words: None,
+        lazy: Some(true),
+        prefilter_any: Some(vec!["SSN".to_string()]),
+        prefilter_case_insensitive: Some(false),
+        prefilter_regex: None,
+        prefilter_window_bytes: Some(80),
+        prepared_artifact_policy: Some(BindingPreparedArtifactPolicy::Omit),
+      }],
+      ..BindingPreparedSearchConfig::default()
+    };
+    let core = prepared_search_config_from_binding(config).unwrap();
+
+    assert!(matches!(
+      core.search.regex_patterns.first(),
+      Some(SearchPattern::RegexWithOptions {
+        prepared_artifact_policy: Some(PreparedArtifactPolicy::Omit),
+        ..
+      })
+    ));
   }
 
   #[test]
@@ -2437,6 +3631,9 @@ mod tests {
         stage: DiagnosticStage::EntityRegex,
         kind: DiagnosticEventKind::Entity,
         count: None,
+        slot: None,
+        subslot: None,
+        pattern_count: None,
         engine: None,
         pattern: None,
         source: None,
@@ -2449,8 +3646,11 @@ mod tests {
         span_valid: None,
         elapsed_us: None,
         input_bytes: None,
+        artifact_count: None,
+        artifact_bytes: None,
         reason: None,
       }],
+      ..StaticRedactionDiagnostics::default()
     };
 
     let error = static_redaction_diagnostics_to_utf16_binding(diagnostics, "á")
@@ -2463,12 +3663,152 @@ mod tests {
   }
 
   #[test]
+  fn ascii_diagnostics_reject_out_of_range_offsets() {
+    let diagnostics = StaticRedactionDiagnostics {
+      events: vec![DiagnosticEvent {
+        stage: DiagnosticStage::EntityRegex,
+        kind: DiagnosticEventKind::Entity,
+        start: Some(4),
+        end: Some(5),
+        ..diagnostic_stage_event(DiagnosticStage::EntityRegex, None, None, None)
+      }],
+      ..StaticRedactionDiagnostics::default()
+    };
+
+    let error =
+      static_redaction_diagnostics_to_utf16_binding(diagnostics, "abc")
+        .unwrap_err();
+
+    assert!(matches!(
+      error,
+      ContractError::InvalidBindingOffset { offset: 4 }
+    ));
+  }
+
+  #[test]
+  fn binding_diagnostic_events_include_pipeline_phase() {
+    let mut prepare_regex =
+      diagnostic_stage_event(DiagnosticStage::PrepareRegex, None, None, None);
+    prepare_regex.slot = Some(0);
+
+    let events = vec![
+      prepare_regex,
+      diagnostic_stage_event(DiagnosticStage::FindLiteral, None, None, None),
+      diagnostic_stage_event(DiagnosticStage::EntityDenyList, None, None, None),
+      diagnostic_stage_event(DiagnosticStage::EntityHotword, None, None, None),
+      diagnostic_stage_event(DiagnosticStage::RedactTotal, None, None, None),
+    ];
+
+    let diagnostics = diagnostic_events_to_binding(&events);
+    let metadata = diagnostics
+      .events
+      .iter()
+      .map(|event| {
+        (
+          event.stage.as_str(),
+          event.phase.as_str(),
+          event.scope.as_str(),
+        )
+      })
+      .collect::<Vec<_>>();
+
+    assert_eq!(
+      metadata,
+      vec![
+        ("prepare.regex", "prepare", "slot"),
+        ("find.literal", "search", "step"),
+        ("entity.deny-list", "detect", "step"),
+        ("entity.hotword", "resolve", "step"),
+        ("redact.total", "redact", "total"),
+      ]
+    );
+  }
+
+  #[test]
+  fn utf16_diagnostic_event_batches_match_full_diagnostics() {
+    let diagnostics = StaticRedactionDiagnostics {
+      events: vec![DiagnosticEvent {
+        stage: DiagnosticStage::EntityRegex,
+        kind: DiagnosticEventKind::Entity,
+        count: None,
+        slot: None,
+        subslot: None,
+        pattern_count: None,
+        engine: None,
+        pattern: None,
+        source: None,
+        source_detail: None,
+        label: Some("name".to_string()),
+        start: Some(0),
+        end: Some(2),
+        text: None,
+        score: Some(0.9),
+        span_valid: Some(true),
+        elapsed_us: Some(12),
+        input_bytes: None,
+        artifact_count: None,
+        artifact_bytes: None,
+        reason: None,
+      }],
+      ..StaticRedactionDiagnostics::default()
+    };
+
+    let full =
+      static_redaction_diagnostics_to_utf16_binding(diagnostics.clone(), "áx")
+        .unwrap();
+    let batch =
+      diagnostic_events_to_utf16_binding(&diagnostics.events, "áx").unwrap();
+
+    assert_eq!(batch, full);
+  }
+
+  #[test]
   fn prepared_search_compressed_package_roundtrips_config_and_artifacts() {
     let config = package_test_config();
     let artifacts = b"prepared-artifacts";
 
     let bytes =
       prepared_search_package_to_compressed_bytes(&config, artifacts).unwrap();
+    let package = prepared_search_package_from_bytes(&bytes).unwrap();
+
+    assert_eq!(
+      package_version(&bytes, PREPARED_SEARCH_COMPRESSED_PACKAGE_HEADER),
+      PREPARED_SEARCH_COMPRESSED_PACKAGE_VERSION
+    );
+    assert_eq!(package.config, config);
+    assert_eq!(package.artifacts, artifacts);
+  }
+
+  #[test]
+  fn prepared_search_compressed_package_reads_legacy_zstd_digest() {
+    let config = package_test_config();
+    let artifacts = b"prepared-artifacts";
+    let payload =
+      prepared_search_package_payload_to_bytes(&config, artifacts).unwrap();
+    let bytes = zstd_compressed_digest_package(
+      PREPARED_SEARCH_COMPRESSED_PACKAGE_HEADER,
+      PREPARED_SEARCH_COMPRESSED_PACKAGE_ZSTD_VERSION,
+      &payload,
+    );
+
+    let package = prepared_search_package_from_bytes(&bytes).unwrap();
+
+    assert_eq!(package.config, config);
+    assert_eq!(package.artifacts, artifacts);
+  }
+
+  #[test]
+  fn prepared_search_compressed_package_reads_legacy_payload_digest() {
+    let config = package_test_config();
+    let artifacts = b"prepared-artifacts";
+    let payload =
+      prepared_search_package_payload_to_bytes(&config, artifacts).unwrap();
+    let bytes = zstd_compressed_package(
+      PREPARED_SEARCH_COMPRESSED_PACKAGE_HEADER,
+      PREPARED_SEARCH_COMPRESSED_PACKAGE_PAYLOAD_DIGEST_VERSION,
+      &payload,
+    );
+
     let package = prepared_search_package_from_bytes(&bytes).unwrap();
 
     assert_eq!(package.config, config);
@@ -2527,7 +3867,7 @@ mod tests {
     let config =
       prepared_search_config_from_binding(package_test_config()).unwrap();
     let mut compact_config = config.clone();
-    compact_config.literal_patterns.clear();
+    compact_config.search.literal_patterns.clear();
     let artifacts = b"prepared-artifacts";
 
     let bytes =
@@ -2552,12 +3892,220 @@ mod tests {
     let config =
       prepared_search_config_from_binding(package_test_config()).unwrap();
     let mut compact_config = config.clone();
-    compact_config.literal_patterns.clear();
+    compact_config.search.literal_patterns.clear();
     let artifacts = b"prepared-artifacts";
 
     let bytes =
       prepared_search_core_package_to_compressed_bytes(&config, artifacts)
         .unwrap();
+    let package = prepared_search_core_package_from_bytes(&bytes).unwrap();
+
+    assert!(prepared_search_package_has_core_payload(&bytes));
+    assert_eq!(
+      package_version(&bytes, PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_HEADER),
+      PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_VERSION
+    );
+    assert_eq!(package.config, compact_config);
+    assert_eq!(package.artifacts, artifacts);
+  }
+
+  #[test]
+  fn prepared_search_core_compressed_package_reads_legacy_zstd_digest() {
+    let config =
+      prepared_search_config_from_binding(package_test_config()).unwrap();
+    let mut compact_config = config.clone();
+    compact_config.search.literal_patterns.clear();
+    let artifacts = b"prepared-artifacts";
+    let payload =
+      prepared_search_core_package_payload_to_bytes(&config, artifacts)
+        .unwrap();
+    let bytes = zstd_compressed_digest_package(
+      PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_HEADER,
+      PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_ZSTD_VERSION,
+      &payload,
+    );
+
+    let package = prepared_search_core_package_from_bytes(&bytes).unwrap();
+
+    assert!(prepared_search_package_has_core_payload(&bytes));
+    assert_eq!(package.config, compact_config);
+    assert_eq!(package.artifacts, artifacts);
+  }
+
+  #[test]
+  fn prepared_search_core_compressed_package_reports_decode_timings() {
+    let config =
+      prepared_search_config_from_binding(package_test_config()).unwrap();
+    let artifacts = b"prepared-artifacts";
+
+    let bytes =
+      prepared_search_core_package_to_compressed_bytes(&config, artifacts)
+        .unwrap();
+    let (package, timings) =
+      prepared_search_core_package_view_from_bytes_with_timings(&bytes)
+        .unwrap();
+
+    assert!(matches!(
+      &package.artifacts.inner,
+      CorePreparedSearchPackageArtifactsInner::OwnedPayload { .. }
+    ));
+    assert!(
+      timings.verify.is_some(),
+      "compressed package digest timing should be reported"
+    );
+    assert!(
+      timings.decompress.is_some(),
+      "compressed package decompression timing should be reported"
+    );
+    assert!(
+      timings.config_decode.is_some(),
+      "core config decode timing should be reported"
+    );
+  }
+
+  #[test]
+  fn prepared_search_core_compressed_package_decodes_config_and_artifacts() {
+    let config =
+      prepared_search_config_from_binding(package_test_config()).unwrap();
+    let artifact_set = PreparedEngineArtifacts::default();
+    let artifact_bytes = artifact_set.to_bytes().unwrap();
+
+    let bytes = prepared_search_core_package_to_compressed_bytes(
+      &config,
+      &artifact_bytes,
+    )
+    .unwrap();
+    let decoded =
+      prepared_search_core_package_decode_from_bytes_with_timings(&bytes)
+        .unwrap();
+
+    assert_eq!(decoded.config.search.literal_patterns, Vec::new());
+    assert_eq!(decoded.artifacts, artifact_set);
+    assert_eq!(decoded.artifacts_bytes, artifact_bytes.len());
+    assert!(
+      decoded.package_decode_timings.verify.is_some(),
+      "compressed package digest timing should be reported"
+    );
+    assert!(
+      decoded.package_decode_timings.decompress.is_some(),
+      "compressed package decompression timing should be reported"
+    );
+    assert!(
+      decoded.package_decode_timings.config_decode.is_some(),
+      "core config decode timing should be reported"
+    );
+  }
+
+  #[test]
+  fn prepared_search_core_trusted_decode_skips_package_digest() {
+    let config =
+      prepared_search_config_from_binding(package_test_config()).unwrap();
+    let artifact_set = PreparedEngineArtifacts::default();
+    let artifact_bytes = artifact_set.to_bytes().unwrap();
+
+    let mut bytes = prepared_search_core_package_to_compressed_bytes(
+      &config,
+      &artifact_bytes,
+    )
+    .unwrap();
+    let digest_start = PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_HEADER
+      .len()
+      .saturating_add(std::mem::size_of::<u32>());
+    let digest_byte = bytes.get_mut(digest_start).unwrap();
+    *digest_byte ^= 0xff;
+
+    let verified =
+      prepared_search_core_package_decode_from_bytes_with_timings(&bytes);
+    assert!(
+      verified.is_err(),
+      "verified decode must reject a package digest mismatch"
+    );
+
+    let trusted =
+      prepared_search_core_package_decode_trusted_from_bytes_with_timings(
+        &bytes,
+      )
+      .unwrap();
+    assert_eq!(trusted.config.search.literal_patterns, Vec::new());
+    assert_eq!(trusted.artifacts, artifact_set);
+    assert_eq!(trusted.artifacts_bytes, artifact_bytes.len());
+    assert!(
+      trusted.package_decode_timings.verify.is_none(),
+      "trusted decode should not spend time verifying the package digest"
+    );
+    assert!(
+      trusted.package_decode_timings.decompress.is_some(),
+      "trusted decode still has to decompress compressed packages"
+    );
+
+    let (trusted_view, trusted_view_timings) =
+      prepared_search_core_package_view_trusted_from_bytes_with_timings(&bytes)
+        .unwrap();
+    assert_eq!(trusted_view.config.search.literal_patterns, Vec::new());
+    assert_eq!(trusted_view.artifacts.as_bytes(), artifact_bytes.as_slice());
+    assert!(
+      trusted_view_timings.verify.is_none(),
+      "trusted view decode should not spend time verifying the package digest"
+    );
+    assert!(
+      trusted_view_timings.decompress.is_some(),
+      "trusted view decode still has to decompress compressed packages"
+    );
+  }
+
+  #[test]
+  fn prepared_search_core_package_compacts_deny_list_originals() {
+    let binding_config = BindingPreparedSearchConfig {
+      deny_list_data: Some(BindingDenyListMatchData {
+        labels: vec![
+          vec![String::from("person")],
+          vec![String::from("matter")],
+        ],
+        custom_labels: vec![Vec::new(), vec![String::from("matter")]],
+        originals: vec![String::from("VAT"), String::from("Secret Code")],
+        sources: vec![
+          vec![String::from("deny-list")],
+          vec![String::from("custom-deny-list")],
+        ],
+        filters: None,
+        ..BindingDenyListMatchData::default()
+      }),
+      ..BindingPreparedSearchConfig::default()
+    };
+    let config = prepared_search_config_from_binding(binding_config).unwrap();
+
+    let bytes =
+      prepared_search_core_package_to_compressed_bytes(&config, b"artifact")
+        .unwrap();
+    let package = prepared_search_core_package_from_bytes(&bytes).unwrap();
+    let data = package.config.detectors.deny_list_data.unwrap();
+
+    assert!(data.originals.is_empty());
+    assert_eq!(data.pattern_meta.len(), 2);
+    let first = data.pattern_meta.first().unwrap();
+    let second = data.pattern_meta.get(1).unwrap();
+    assert!(first.has_alphanumeric);
+    assert!(first.short_upper_acronym);
+    assert!(second.has_alphanumeric);
+    assert!(!second.short_upper_acronym);
+  }
+
+  #[test]
+  fn prepared_search_core_compressed_package_reads_legacy_payload_digest() {
+    let config =
+      prepared_search_config_from_binding(package_test_config()).unwrap();
+    let mut compact_config = config.clone();
+    compact_config.search.literal_patterns.clear();
+    let artifacts = b"prepared-artifacts";
+    let payload =
+      prepared_search_core_package_payload_to_bytes(&config, artifacts)
+        .unwrap();
+    let bytes = zstd_compressed_package(
+      PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_HEADER,
+      PREPARED_SEARCH_CORE_COMPRESSED_PACKAGE_PAYLOAD_DIGEST_VERSION,
+      &payload,
+    );
+
     let package = prepared_search_core_package_from_bytes(&bytes).unwrap();
 
     assert!(prepared_search_package_has_core_payload(&bytes));
@@ -2577,9 +4125,52 @@ mod tests {
         prefilter_any: None,
         prefilter_case_insensitive: None,
         prefilter_regex: None,
+        prefilter_window_bytes: None,
+        prepared_artifact_policy: None,
       }],
       ..BindingPreparedSearchConfig::default()
     }
+  }
+
+  fn zstd_compressed_package(
+    header: [u8; 8],
+    version: u32,
+    payload: &[u8],
+  ) -> Vec<u8> {
+    let compressed =
+      zstd::bulk::compress(payload, PREPARED_SEARCH_PACKAGE_ZSTD_LEVEL)
+        .unwrap();
+    let digest = blake3::hash(payload);
+    let mut bytes = Vec::new();
+    write_package_header(&mut bytes, header, version, digest.as_bytes());
+    let payload_len = u64::try_from(payload.len()).unwrap();
+    bytes.extend_from_slice(&payload_len.to_le_bytes());
+    bytes.extend_from_slice(&compressed);
+    bytes
+  }
+
+  fn zstd_compressed_digest_package(
+    header: [u8; 8],
+    version: u32,
+    payload: &[u8],
+  ) -> Vec<u8> {
+    let compressed =
+      zstd::bulk::compress(payload, PREPARED_SEARCH_PACKAGE_ZSTD_LEVEL)
+        .unwrap();
+    let digest = blake3::hash(&compressed);
+    let mut bytes = Vec::new();
+    write_package_header(&mut bytes, header, version, digest.as_bytes());
+    let payload_len = u64::try_from(payload.len()).unwrap();
+    bytes.extend_from_slice(&payload_len.to_le_bytes());
+    bytes.extend_from_slice(&compressed);
+    bytes
+  }
+
+  fn package_version(bytes: &[u8], header: [u8; 8]) -> u32 {
+    let version_start = header.len();
+    let version_end = version_start.saturating_add(std::mem::size_of::<u32>());
+    let version_bytes = bytes.get(version_start..version_end).unwrap();
+    u32::from_le_bytes(<[u8; 4]>::try_from(version_bytes).unwrap())
   }
 
   fn compressed_package_with_len(

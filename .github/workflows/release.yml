@@ -2,6 +2,7 @@ name: Release
 
 env:
   NPM_VERSION: "11.11.1"
+  UV_VERSION: "0.10.1"
 
 on:
   push:
@@ -10,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       publish_to_npm:
-        description: Publish the current package versions to npm after verification
+        description: Publish the current package versions to npm AND PyPI after verification (PyPI releases are immutable)
         required: true
         default: false
         type: boolean
@@ -24,8 +25,34 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      dist_tag: ${{ steps.dist-tag.outputs.dist_tag }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Derive npm dist-tag from VERSION
+        id: dist-tag
+        run: |
+          set -euo pipefail
+          if [[ ! -f VERSION ]]; then
+            echo "::error::VERSION file is missing"
+            exit 1
+          fi
+
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta|alpha)\.[0-9]+)?$ ]]; then
+            echo "::error::VERSION must look like 1.2.3, 1.2.3-rc.1, 1.2.3-beta.1, or 1.2.3-alpha.1; got '$version'"
+            exit 1
+          fi
+
+          # Prereleases publish under their identifier (alpha/beta/rc) so a
+          # test build never becomes the npm `latest` tag; stable stays latest.
+          dist_tag="latest"
+          if [[ "$version" =~ -(rc|beta|alpha)\. ]]; then
+            dist_tag="${BASH_REMATCH[1]}"
+          fi
+
+          echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
@@ -45,6 +72,9 @@ jobs:
       - name: Sync runtime package versions
         run: bun run sync:version
 
+      - name: Verify native sidecar metadata
+        run: node .github/tools/check-native-sidecars.mjs
+
       - name: Build
         run: bun run build
 
@@ -54,14 +84,181 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      - name: Install uv
+        run: |
+          python3 -m pip install --user "uv==${{ env.UV_VERSION }}"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Python typecheck
+        run: bun run python:typecheck
+
+      - name: Python wheel
+        run: bun run python:wheel
+        env:
+          ANONYMIZE_PYTHON_WHEEL_PROFILE: release
+
       - name: Test
         run: bun run test
 
       - name: Verify package tarballs
         run: node .github/tools/check-packlist.mjs
 
-  publish:
+  pack-native:
     needs: verify
+    if: github.event_name == 'push' || inputs.publish_to_npm == true
+    name: Pack ${{ matrix.package }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: packages/anonymize-linux-x64-gnu
+            runner: ubuntu-24.04
+          - package: packages/anonymize-linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+          - package: packages/anonymize-darwin-x64
+            runner: macos-15-intel
+          - package: packages/anonymize-darwin-arm64
+            runner: macos-15
+          - package: packages/anonymize-win32-x64-msvc
+            runner: windows-2025
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+
+      - name: Install npm for packing
+        run: npm install --global "npm@${{ env.NPM_VERSION }}"
+
+      - name: Verify Bun workflow pin
+        run: node .github/tools/check-bun-workflows.mjs
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: "package.json"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Sync runtime package versions
+        run: bun run sync:version
+
+      - name: Build
+        run: bun run build
+        env:
+          # Native sidecar packs only need the platform .node binding; skip
+          # the wasm32-wasip1-threads build on the platform matrix runners.
+          STELLA_ANONYMIZE_SKIP_WASM_BUILD: "1"
+
+      - name: Read package metadata
+        id: package
+        working-directory: ${{ matrix.package }}
+        run: |
+          package_name="$(node -p "require('./package.json').name")"
+          artifact_name="$(
+            node -e '
+              const name = require("./package.json").name;
+              console.log(`npm-tarball-${name.replace(/^@/, "").replace(/[\\/]/g, "-")}`);
+            '
+          )"
+
+          echo "name=${package_name}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=${artifact_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Pack package
+        id: pack
+        working-directory: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          pack_dir="$RUNNER_TEMP/npm-tarballs"
+          mkdir -p "$pack_dir"
+
+          pack_json="$(npm pack --json --ignore-scripts --pack-destination "$pack_dir")"
+          node -e '
+            const pack = JSON.parse(process.argv[1])[0];
+            const files = new Set(pack.files.map((file) => file.path));
+            for (const required of ["index.cjs", "stella_anonymize_napi.node"]) {
+              if (!files.has(required)) {
+                console.error(`::error::${pack.name} tarball is missing ${required}`);
+                process.exit(1);
+              }
+            }
+          ' "$pack_json"
+          filename="$(
+            node -e '
+              const pack = JSON.parse(process.argv[1]);
+              console.log(pack[0].filename);
+            ' "$pack_json"
+          )"
+
+          echo "tarball=${pack_dir}/${filename}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload package tarball
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v5
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+
+  publish-native:
+    needs: [verify, pack-native]
+    if: github.event_name == 'push' || inputs.publish_to_npm == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        artifact:
+          - npm-tarball-stll-anonymize-linux-x64-gnu
+          - npm-tarball-stll-anonymize-linux-arm64-gnu
+          - npm-tarball-stll-anonymize-darwin-x64
+          - npm-tarball-stll-anonymize-darwin-arm64
+          - npm-tarball-stll-anonymize-win32-x64-msvc
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ matrix.artifact }}
+          path: native-tarball
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+
+      - name: Install npm for trusted publishing
+        run: npm install --global "npm@${{ env.NPM_VERSION }}"
+
+      - name: Find package tarball
+        id: tarball
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=(native-tarball/*.tgz)
+          if [[ "${#tarballs[@]}" -ne 1 ]]; then
+            echo "::error::Expected one native tarball for ${{ matrix.artifact }}, found ${#tarballs[@]}"
+            exit 1
+          fi
+          echo "path=${tarballs[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish package
+        uses: stella/.github/.github/actions/npm-publish-hardened@4292546b5b6e5bd8660bd727913b4038644c3d0b
+        with:
+          tarball: ${{ steps.tarball.outputs.path }}
+          tag: ${{ needs.verify.outputs.dist_tag }}
+
+  publish:
+    needs: [verify, publish-native]
     if: github.event_name == 'push' || inputs.publish_to_npm == true
     runs-on: ubuntu-latest
     permissions:
@@ -77,7 +274,7 @@ jobs:
           - packages/anonymize/wasm
           - packages/cli
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
@@ -150,16 +347,161 @@ jobs:
         uses: stella/.github/.github/actions/npm-publish-hardened@4292546b5b6e5bd8660bd727913b4038644c3d0b
         with:
           tarball: ${{ steps.pack.outputs.tarball }}
+          tag: ${{ needs.verify.outputs.dist_tag }}
+
+  build-wheels:
+    needs: verify
+    if: github.event_name == 'push' || inputs.publish_to_npm == true
+    name: Build wheel ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            manylinux: auto
+            # abi3 wheels are Python-agnostic (cp311-abi3), so verifying one
+            # matrix wheel exercises the packlist + smoke test for all of them.
+            check_wheel: true
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            manylinux: auto
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+
+      - name: Verify Bun workflow pin
+        run: node .github/tools/check-bun-workflows.mjs
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: "package.json"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Sync runtime package versions
+        run: bun run sync:version
+
+      - name: Build native pipeline packages
+        run: bun run build
+        env:
+          # The wheel only needs the generated .stlanonpkg native pipeline
+          # packages; skip the wasm32-wasip1-threads build like pack-native.
+          STELLA_ANONYMIZE_SKIP_WASM_BUILD: "1"
+
+      - name: Bundle native pipeline packages into the wheel source
+        run: |
+          set -euo pipefail
+          source_dir="packages/anonymize"
+          target_dir="crates/anonymize-py/python/stella_anonymize/native_packages"
+          if [[ ! -f "${source_dir}/native-pipeline.stlanonpkg" ]]; then
+            echo "::error::native-pipeline.stlanonpkg missing from ${source_dir}; bun run build did not emit it"
+            exit 1
+          fi
+          mkdir -p "${target_dir}"
+          shopt -s nullglob
+          for package in "${source_dir}"/native-pipeline*.stlanonpkg; do
+            cp "${package}" "${target_dir}/"
+          done
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.target }}
+          # Ignored on macOS/Windows; drives the manylinux container on Linux.
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          rust-toolchain: "1.96.0"
+          args: >-
+            --release
+            --locked
+            --manifest-path crates/anonymize-py/Cargo.toml
+            --out dist
+        env:
+          # Non-container builds honour this directly; Linux wheels are already
+          # guarded by the bundle step above.
+          STELLA_ANONYMIZE_REQUIRE_NATIVE_PACKAGES: "1"
+
+      - name: Install uv
+        if: matrix.check_wheel
+        run: |
+          python3 -m pip install --user "uv==${{ env.UV_VERSION }}"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify wheel packlist and smoke test
+        if: matrix.check_wheel
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "::error::Expected one wheel for ${{ matrix.target }}, found ${#wheels[@]}"
+            exit 1
+          fi
+          ANONYMIZE_PYTHON_WHEEL_PATH="${wheels[0]}" bun run python:wheel
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v5
+        with:
+          name: python-wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish-pypi:
+    needs: [verify, build-wheels]
+    if: github.event_name == 'push' || inputs.publish_to_npm == true
+    runs-on: ubuntu-latest
+    permissions:
+      # Trusted Publishing (OIDC): no PyPI API token is stored in the repo.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: python-wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check wheels are present
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [[ "${#wheels[@]}" -eq 0 ]]; then
+            echo "::error::No wheels found to publish to PyPI"
+            exit 1
+          fi
+          printf 'Publishing %d wheel(s):\n' "${#wheels[@]}"
+          printf '  %s\n' "${wheels[@]}"
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          packages-dir: dist
 
   github-release:
     name: Create GitHub release
-    needs: [verify, publish]
-    if: needs.verify.result == 'success' && needs.publish.result == 'success' && (github.event_name == 'push' || inputs.publish_to_npm == true)
+    needs: [verify, publish-native, publish, publish-pypi]
+    if: needs.verify.result == 'success' && needs.publish-native.result == 'success' && needs.publish.result == 'success' && needs.publish-pypi.result == 'success' && (github.event_name == 'push' || inputs.publish_to_npm == true)
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
 

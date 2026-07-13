@@ -3,8 +3,18 @@ import {
   type GazetteerEntry,
   type PipelineConfig,
 } from "./types";
+import { languageSelectionKey } from "./util/language-selection";
 
 const DEFAULT_CUSTOM_REGEX_SCORE = 0.9;
+
+const contentLanguageFingerprint = (
+  config: Pick<PipelineConfig, "language" | "languages">,
+): string => {
+  const languages =
+    config.languages ??
+    (config.language === undefined ? [] : [config.language]);
+  return languageSelectionKey(languages);
+};
 
 export const pipelineConfigKey = (
   config: PipelineConfig,
@@ -31,6 +41,7 @@ export const pipelineConfigKey = (
             JSON.stringify({
               label: entry.label,
               pattern: entry.pattern,
+              preparedArtifactPolicy: entry.preparedArtifactPolicy ?? null,
               score: entry.score ?? DEFAULT_CUSTOM_REGEX_SCORE,
             }),
           )
@@ -57,6 +68,7 @@ export const pipelineConfigKey = (
     `${config.enableTriggerPhrases}:` +
     `${legalFormsEnabled}:` +
     `${config.enableNameCorpus}:` +
+    `${contentLanguageFingerprint(config)}:` +
     `${config.nameCorpusLanguages?.toSorted().join(",") ?? ""}:` +
     `${config.enableRegex}:` +
     `${config.threshold}:` +

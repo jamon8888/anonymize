@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 
 use crate::byte_offsets::ByteOffsets;
 use crate::processors::PatternSlice;
@@ -35,50 +36,92 @@ pub struct LegalFormData {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedLegalFormData {
   suffixes: Vec<String>,
-  normalized_boundary_suffixes: BTreeSet<String>,
-  normalized_in_name_words: BTreeSet<String>,
-  normalized_suffix_words: BTreeSet<String>,
-  role_heads: BTreeSet<String>,
-  sentence_verb_indicators: BTreeSet<String>,
-  clause_noun_heads: BTreeSet<String>,
-  connector_prose_heads: BTreeSet<String>,
-  structural_single_cap_prefixes: BTreeSet<String>,
+  list_suffix_indices: Vec<usize>,
+  suffix_indices_by_last_char: HashMap<char, Vec<usize>>,
+  normalized_boundary_suffixes: HashSet<String>,
+  normalized_in_name_words: HashSet<String>,
+  normalized_suffix_words: HashSet<String>,
+  role_heads: HashSet<String>,
+  sentence_verb_indicators: HashSet<String>,
+  clause_noun_heads: HashSet<String>,
+  connector_prose_heads: HashSet<String>,
+  structural_single_cap_prefixes: HashSet<String>,
   leading_clause_phrases: Vec<String>,
   leading_clause_direct_prefixes: Vec<String>,
-  connector_words: BTreeSet<String>,
-  and_connector_words: BTreeSet<String>,
-  in_name_prepositions: BTreeSet<String>,
-  company_suffix_words: BTreeSet<String>,
-  comma_gated_direct_prefixes: BTreeSet<String>,
+  connector_words: HashSet<String>,
+  and_connector_words: HashSet<String>,
+  in_name_prepositions: HashSet<String>,
+  company_suffix_words: HashSet<String>,
+  comma_gated_direct_prefixes: HashSet<String>,
 }
 
 impl PreparedLegalFormData {
   pub(crate) fn new(data: LegalFormData) -> Self {
+    let LegalFormData {
+      suffixes,
+      normalized_boundary_suffixes,
+      normalized_in_name_words,
+      normalized_suffix_words,
+      role_heads,
+      sentence_verb_indicators,
+      clause_noun_heads,
+      connector_prose_heads,
+      structural_single_cap_prefixes,
+      leading_clause_phrases,
+      leading_clause_direct_prefixes,
+      connector_words,
+      and_connector_words,
+      in_name_prepositions,
+      company_suffix_words,
+      comma_gated_direct_prefixes,
+    } = data;
+    let list_suffix_indices = list_suffix_indices(&suffixes);
+    let suffix_indices_by_last_char = suffix_indices_by_last_char(&suffixes);
+
     Self {
-      suffixes: data.suffixes,
-      normalized_boundary_suffixes: lower_set(
-        data.normalized_boundary_suffixes,
-      ),
-      normalized_in_name_words: lower_set(data.normalized_in_name_words),
-      normalized_suffix_words: lower_set(data.normalized_suffix_words),
-      role_heads: lower_set(data.role_heads),
-      sentence_verb_indicators: lower_set(data.sentence_verb_indicators),
-      clause_noun_heads: lower_set(data.clause_noun_heads),
-      connector_prose_heads: lower_set(data.connector_prose_heads),
-      structural_single_cap_prefixes: lower_set(
-        data.structural_single_cap_prefixes,
-      ),
-      leading_clause_phrases: lower_vec(data.leading_clause_phrases),
-      leading_clause_direct_prefixes: lower_vec(
-        data.leading_clause_direct_prefixes,
-      ),
-      connector_words: lower_set(data.connector_words),
-      and_connector_words: lower_set(data.and_connector_words),
-      in_name_prepositions: lower_set(data.in_name_prepositions),
-      company_suffix_words: lower_set(data.company_suffix_words),
-      comma_gated_direct_prefixes: lower_set(data.comma_gated_direct_prefixes),
+      suffixes,
+      list_suffix_indices,
+      suffix_indices_by_last_char,
+      normalized_boundary_suffixes: lower_set(normalized_boundary_suffixes),
+      normalized_in_name_words: lower_set(normalized_in_name_words),
+      normalized_suffix_words: lower_set(normalized_suffix_words),
+      role_heads: lower_set(role_heads),
+      sentence_verb_indicators: lower_set(sentence_verb_indicators),
+      clause_noun_heads: lower_set(clause_noun_heads),
+      connector_prose_heads: lower_set(connector_prose_heads),
+      structural_single_cap_prefixes: lower_set(structural_single_cap_prefixes),
+      leading_clause_phrases: lower_vec(leading_clause_phrases),
+      leading_clause_direct_prefixes: lower_vec(leading_clause_direct_prefixes),
+      connector_words: lower_set(connector_words),
+      and_connector_words: lower_set(and_connector_words),
+      in_name_prepositions: lower_set(in_name_prepositions),
+      company_suffix_words: lower_set(company_suffix_words),
+      comma_gated_direct_prefixes: lower_set(comma_gated_direct_prefixes),
     }
   }
+}
+
+fn list_suffix_indices(suffixes: &[String]) -> Vec<usize> {
+  suffixes
+    .iter()
+    .enumerate()
+    .filter_map(|(index, suffix)| {
+      (!is_roman_legal_suffix(suffix)).then_some(index)
+    })
+    .collect()
+}
+
+fn suffix_indices_by_last_char(
+  suffixes: &[String],
+) -> HashMap<char, Vec<usize>> {
+  let mut by_char = HashMap::<char, Vec<usize>>::new();
+  for (index, suffix) in suffixes.iter().enumerate() {
+    let Some(last) = suffix.chars().next_back() else {
+      continue;
+    };
+    by_char.entry(last).or_default().push(index);
+  }
+  by_char
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,10 +167,13 @@ pub(crate) fn process_legal_form_matches(
     if walker_start >= effective_suffix_start {
       continue;
     }
-    if crosses_sentence_end(full_text, walker_start, effective_suffix_start) {
-      continue;
-    }
 
+    // Narrow to the org name before the sentence check. The walker bridges
+    // lowercase words (up to MAX_LOWER_BRIDGE) and can reach back over a verb
+    // clause into a prior sentence ("Initech term sheet. This deed is made by
+    // Initech Corporation"). trim_to_first_cap_after_verb drops that prose, so
+    // the sentence-boundary guard must run on the trimmed span or it rejects a
+    // candidate that would have trimmed cleanly to a single-sentence org.
     let candidate_start = trim_to_first_cap_after_verb(
       full_text,
       walker_start,
@@ -135,6 +181,10 @@ pub(crate) fn process_legal_form_matches(
       data,
     );
     if candidate_start >= effective_suffix_start {
+      continue;
+    }
+    if crosses_sentence_end(full_text, candidate_start, effective_suffix_start)
+    {
       continue;
     }
 
@@ -230,7 +280,7 @@ fn walk_backward(
       }
     }
 
-    if data.connector_words.contains(&token.text.to_lowercase()) {
+    if contains_lowercase(&data.connector_words, token.text) {
       let previous = token_before(text, token.start);
       if previous
         .as_ref()
@@ -240,7 +290,7 @@ fn walk_backward(
       }
       if data
         .and_connector_words
-        .contains(&token.text.to_lowercase())
+        .contains(lowercase_lookup(token.text).as_ref())
       {
         let upper_before = count_upper_before(text, token.start);
         if upper_before <= 2 || has_middle_initial_before(text, token.start) {
@@ -319,7 +369,7 @@ fn is_token_char(ch: char) -> bool {
 fn is_acceptable_token(token: &str, data: &PreparedLegalFormData) -> bool {
   token.chars().next().is_some_and(|ch| {
     ch.is_uppercase() || ch.is_lowercase() || ch.is_ascii_digit()
-  }) || data.connector_words.contains(&token.to_lowercase())
+  }) || contains_lowercase(&data.connector_words, token)
 }
 
 fn starts_upper(text: &str) -> bool {
@@ -337,25 +387,40 @@ fn starts_with_list_separator(text: &str) -> bool {
     .is_some_and(|ch| matches!(ch, ',' | ';'))
 }
 
-fn normalize_suffix_token(text: &str) -> String {
-  text
+fn normalize_suffix_token(text: &str) -> Cow<'_, str> {
+  if !text
     .chars()
-    .filter(|ch| {
-      !matches!(ch, '.' | ',' | ' ' | '\t' | '\u{00a0}' | '\u{202f}')
-    })
-    .collect::<String>()
-    .to_lowercase()
+    .any(|ch| is_suffix_ignored_char(ch) || ch.is_uppercase())
+  {
+    return Cow::Borrowed(text);
+  }
+
+  let mut normalized = String::with_capacity(text.len());
+  for ch in text.chars() {
+    if is_suffix_ignored_char(ch) {
+      continue;
+    }
+    normalized.extend(ch.to_lowercase());
+  }
+  Cow::Owned(normalized)
+}
+
+const fn is_suffix_ignored_char(ch: char) -> bool {
+  matches!(ch, '.' | ',' | ' ' | '\t' | '\u{00a0}' | '\u{202f}')
 }
 
 fn is_legal_form_suffix_word(word: &str, data: &PreparedLegalFormData) -> bool {
   let normalized = normalize_suffix_token(word);
-  !normalized.is_empty() && data.normalized_suffix_words.contains(&normalized)
+  !normalized.is_empty()
+    && data.normalized_suffix_words.contains(normalized.as_ref())
 }
 
 fn is_known_boundary_suffix(word: &str, data: &PreparedLegalFormData) -> bool {
   let normalized = normalize_suffix_token(word);
   !normalized.is_empty()
-    && data.normalized_boundary_suffixes.contains(&normalized)
+    && data
+      .normalized_boundary_suffixes
+      .contains(normalized.as_ref())
 }
 
 fn is_in_name_legal_form_word(
@@ -363,7 +428,8 @@ fn is_in_name_legal_form_word(
   data: &PreparedLegalFormData,
 ) -> bool {
   let normalized = normalize_suffix_token(word);
-  !normalized.is_empty() && data.normalized_in_name_words.contains(&normalized)
+  !normalized.is_empty()
+    && data.normalized_in_name_words.contains(normalized.as_ref())
 }
 
 fn count_upper_before(text: &str, pos: usize) -> usize {
@@ -429,7 +495,17 @@ fn crosses_sentence_end(text: &str, start: usize, suffix_start: usize) -> bool {
 
   for ch in slice.chars() {
     if ch.is_uppercase() {
-      uppercase_run = uppercase_run.saturating_add(1);
+      // An interior dot delimits a word, so a capital right after one starts
+      // a fresh run. This keeps compact initials ("J.P.") from looking like a
+      // two-letter acronym followed by a sentence break, while a real acronym
+      // ("INC.") still accumulates its run before the trailing period. The
+      // lowercase branch below already gates on the previous char, so only the
+      // uppercase run needs this guard.
+      uppercase_run = if previous == Some('.') {
+        1
+      } else {
+        uppercase_run.saturating_add(1)
+      };
       lowercase_run = 0;
       previous = Some(ch);
       continue;
@@ -471,9 +547,7 @@ fn trim_to_first_cap_after_verb(
   let mut last_verb_end = None::<usize>;
   for token in word_tokens(text, candidate_start, suffix_start) {
     if starts_lower(token.text)
-      && data
-        .sentence_verb_indicators
-        .contains(&token.text.to_lowercase())
+      && contains_lowercase(&data.sentence_verb_indicators, token.text)
     {
       last_verb_end = Some(token.end);
     }
@@ -486,9 +560,9 @@ fn trim_to_first_cap_after_verb(
     if !starts_upper(token.text) {
       continue;
     }
-    let lower = token.text.to_lowercase();
-    if data.role_heads.contains(&lower)
-      || data.clause_noun_heads.contains(&lower)
+    let lower = lowercase_lookup(token.text);
+    if data.role_heads.contains(lower.as_ref())
+      || data.clause_noun_heads.contains(lower.as_ref())
     {
       continue;
     }
@@ -498,39 +572,55 @@ fn trim_to_first_cap_after_verb(
   suffix_start
 }
 
-fn word_tokens(text: &str, start: usize, end: usize) -> Vec<Token<'_>> {
-  let mut tokens = Vec::new();
-  let mut cursor = start;
-  while cursor < end {
-    let Some((ch_start, ch)) = next_char(text, cursor) else {
-      break;
-    };
-    if !is_word_token_char(ch) {
-      cursor = ch_start.saturating_add(ch.len_utf8());
-      continue;
-    }
+const fn word_tokens(text: &str, start: usize, end: usize) -> WordTokens<'_> {
+  WordTokens {
+    text,
+    end,
+    cursor: start,
+  }
+}
 
-    let token_start = ch_start;
-    let mut token_end = ch_start.saturating_add(ch.len_utf8());
-    while token_end < end {
-      let Some((next_start, next)) = next_char(text, token_end) else {
-        break;
+struct WordTokens<'a> {
+  text: &'a str,
+  end: usize,
+  cursor: usize,
+}
+
+impl<'a> Iterator for WordTokens<'a> {
+  type Item = Token<'a>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    while self.cursor < self.end {
+      let Some((ch_start, ch)) = next_char(self.text, self.cursor) else {
+        self.cursor = self.end;
+        return None;
       };
-      if !is_word_token_char(next) {
-        break;
+      if !is_word_token_char(ch) {
+        self.cursor = ch_start.saturating_add(ch.len_utf8());
+        continue;
       }
-      token_end = next_start.saturating_add(next.len_utf8());
-    }
-    if let Some(token_text) = text.get(token_start..token_end) {
-      tokens.push(Token {
+
+      let token_start = ch_start;
+      let mut token_end = ch_start.saturating_add(ch.len_utf8());
+      while token_end < self.end {
+        let Some((next_start, next)) = next_char(self.text, token_end) else {
+          break;
+        };
+        if !is_word_token_char(next) {
+          break;
+        }
+        token_end = next_start.saturating_add(next.len_utf8());
+      }
+      self.cursor = token_end;
+      let token_text = self.text.get(token_start..token_end)?;
+      return Some(Token {
         start: token_start,
         end: token_end,
         text: token_text,
       });
     }
-    cursor = token_end;
+    None
   }
-  tokens
 }
 
 fn is_word_token_char(ch: char) -> bool {
@@ -591,9 +681,13 @@ fn process_candidate(
     return;
   }
 
-  let role_trimmed = if let Some(trimmed) =
-    trim_role_head(full_text, processed_start, processed_text, data)
-  {
+  let role_trimmed = if let Some(trimmed) = trim_role_head(
+    full_text,
+    processed_start,
+    processed_text,
+    candidate.suffix_start,
+    data,
+  ) {
     let Some(next_text) = full_text.get(trimmed.start..processed_end) else {
       return;
     };
@@ -728,23 +822,23 @@ fn trim_role_head(
   full_text: &str,
   match_start: usize,
   text: &str,
+  suffix_start: usize,
   data: &PreparedLegalFormData,
 ) -> Option<TrimmedStart> {
   let first = first_role_word(text)?;
-  let first_lower = first.text.to_lowercase();
-  let first_leading = first
-    .text
-    .split('-')
-    .next()
-    .unwrap_or_default()
-    .to_lowercase();
-  if !data.role_heads.contains(&first_lower)
-    && !data.role_heads.contains(&first_leading)
+  let first_lower = lowercase_lookup(first.text);
+  let first_leading = first.text.split('-').next().unwrap_or_default();
+  let first_leading = lowercase_lookup(first_leading);
+  if !data.role_heads.contains(first_lower.as_ref())
+    && !data.role_heads.contains(first_leading.as_ref())
   {
     return None;
   }
 
-  let suffix_offset = suffix_offset_in_text(text, data)?;
+  let suffix_offset = suffix_start.checked_sub(match_start)?;
+  if suffix_offset >= text.len() {
+    return None;
+  }
   let mid_start = first.end;
   if mid_start >= suffix_offset {
     return None;
@@ -754,7 +848,7 @@ fn trim_role_head(
   for token in word_tokens(text, mid_start, suffix_offset) {
     if data
       .sentence_verb_indicators
-      .contains(&token.text.to_lowercase())
+      .contains(lowercase_lookup(token.text).as_ref())
     {
       last_verb_end = Some(token.end);
     }
@@ -777,9 +871,9 @@ fn trim_role_head(
     if !starts_upper(token.text) {
       continue;
     }
-    let lower = token.text.to_lowercase();
-    if data.role_heads.contains(&lower)
-      || data.clause_noun_heads.contains(&lower)
+    let lower = lowercase_lookup(token.text);
+    if data.role_heads.contains(lower.as_ref())
+      || data.clause_noun_heads.contains(lower.as_ref())
     {
       continue;
     }
@@ -821,21 +915,6 @@ fn first_role_word(text: &str) -> Option<Token<'_>> {
   })
 }
 
-fn suffix_offset_in_text(
-  text: &str,
-  data: &PreparedLegalFormData,
-) -> Option<usize> {
-  for suffix in &data.suffixes {
-    let Some(offset) = text.rfind(suffix) else {
-      continue;
-    };
-    if offset.saturating_add(suffix.len()) >= text.len().saturating_sub(1) {
-      return Some(offset);
-    }
-  }
-  None
-}
-
 fn preceding_word_is_sentence_verb(
   full_text: &str,
   match_start: usize,
@@ -848,7 +927,7 @@ fn preceding_word_is_sentence_verb(
   trailing_word(before).is_some_and(|word| {
     data
       .sentence_verb_indicators
-      .contains(&word.text.to_lowercase())
+      .contains(lowercase_lookup(word.text).as_ref())
   })
 }
 
@@ -865,7 +944,7 @@ fn is_structural_single_cap_match(
   };
   data
     .structural_single_cap_prefixes
-    .contains(&first.to_lowercase())
+    .contains(lowercase_lookup(first).as_ref())
     && is_single_cap_token(second.trim_matches(','))
 }
 
@@ -881,7 +960,7 @@ fn is_bare_single_cap_structural_inner_match(
   token_before(full_text, match_start).is_some_and(|token| {
     data
       .structural_single_cap_prefixes
-      .contains(&token.text.to_lowercase())
+      .contains(lowercase_lookup(token.text).as_ref())
   })
 }
 
@@ -956,18 +1035,18 @@ fn extend_backward(
 ) -> usize {
   let head_word = leading_entity_word(full_text, match_start);
   let suffix_mode = force_suffix_mode
-    || head_word.as_ref().is_some_and(|word| {
-      data.company_suffix_words.contains(&word.to_lowercase())
-    });
+    || head_word
+      .as_ref()
+      .is_some_and(|word| contains_lowercase(&data.company_suffix_words, word));
   let mut pos = match_start;
 
   while let Some(found) = simple_word_before(full_text, pos) {
     let word = found.text;
-    let lower = word.to_lowercase();
+    let lower = lowercase_lookup(word);
     let is_upper = starts_upper(word);
-    let is_connector = data.connector_words.contains(&lower);
+    let is_connector = data.connector_words.contains(lower.as_ref());
     let is_in_name_prep =
-      suffix_mode && data.in_name_prepositions.contains(&lower);
+      suffix_mode && data.in_name_prepositions.contains(lower.as_ref());
 
     if is_upper {
       pos = found.start;
@@ -983,17 +1062,17 @@ fn extend_backward(
       {
         break;
       }
-      if data.and_connector_words.contains(&lower) {
+      if data.and_connector_words.contains(lower.as_ref()) {
         let upper_before =
           count_upper_words_before(full_text, found.start, suffix_mode, data);
         let middle_initial = has_middle_initial_before(full_text, found.start);
         if upper_before <= 1
           && (data
             .clause_noun_heads
-            .contains(&previous.text.to_lowercase())
+            .contains(lowercase_lookup(previous.text).as_ref())
             || data
               .connector_prose_heads
-              .contains(&previous.text.to_lowercase()))
+              .contains(lowercase_lookup(previous.text).as_ref()))
         {
           break;
         }
@@ -1088,7 +1167,7 @@ fn count_upper_words_before(
     if cross_in_name_preps
       && data
         .in_name_prepositions
-        .contains(&found.text.to_lowercase())
+        .contains(lowercase_lookup(found.text).as_ref())
     {
       let Some(previous) = simple_word_before(full_text, found.start) else {
         break;
@@ -1162,11 +1241,15 @@ fn split_embedded_legal_form_list<'a>(
   entity_text: &'a str,
   data: &PreparedLegalFormData,
 ) -> Vec<Segment<'a>> {
+  if !entity_text.contains([',', ';']) {
+    return vec![Segment {
+      start: entity_start,
+      text: entity_text,
+    }];
+  }
+
   let mut cuts = vec![0_usize];
-  for suffix in &data.suffixes {
-    if is_roman_numeral(&clean_suffix(suffix)) {
-      continue;
-    }
+  for suffix in list_suffixes(data) {
     let mut search_from = 0_usize;
     while let Some(relative) = entity_text
       .get(search_from..)
@@ -1249,7 +1332,20 @@ fn legal_list_boundary_len(text: &str) -> usize {
 }
 
 fn ends_with_legal_suffix(text: &str, data: &PreparedLegalFormData) -> bool {
-  data.suffixes.iter().any(|suffix| text.ends_with(suffix))
+  let Some(last) = text.chars().next_back() else {
+    return false;
+  };
+  data
+    .suffix_indices_by_last_char
+    .get(&last)
+    .is_some_and(|indices| {
+      indices.iter().any(|index| {
+        data
+          .suffixes
+          .get(*index)
+          .is_some_and(|suffix| text.ends_with(suffix))
+      })
+    })
 }
 
 fn trim_embedded_legal_form_list_prefix<'a>(
@@ -1257,11 +1353,12 @@ fn trim_embedded_legal_form_list_prefix<'a>(
   entity_text: &'a str,
   data: &PreparedLegalFormData,
 ) -> (usize, &'a str) {
+  if !entity_text.contains(',') {
+    return (entity_start, entity_text);
+  }
+
   let mut cut = 0_usize;
-  for suffix in &data.suffixes {
-    if is_roman_numeral(&clean_suffix(suffix)) {
-      continue;
-    }
+  for suffix in list_suffixes(data) {
     let mut search_from = 0_usize;
     while let Some(relative) = entity_text
       .get(search_from..)
@@ -1323,7 +1420,14 @@ fn trim_leading_clause(
   text: &str,
   data: &PreparedLegalFormData,
 ) -> LeadingTrim {
-  let lower = text.to_lowercase();
+  // Search on a lowercased copy for case-insensitive matching, but keep a map
+  // back to original byte offsets. `to_lowercase()` can change byte lengths
+  // ("İ" U+0130 -> "i" + U+0307), so any offset taken from `lower` must be
+  // translated before it is used to slice the original `text` or returned as a
+  // cut (the caller slices the original with it).
+  let (lower, lower_to_orig) = lowercase_with_offset_map(text);
+  let to_orig =
+    |offset: usize| lower_to_orig.get(offset).copied().unwrap_or(text.len());
   let mut cut = 0_usize;
 
   for phrase in &data.leading_clause_phrases {
@@ -1341,7 +1445,7 @@ fn trim_leading_clause(
           .is_some_and(char::is_whitespace);
       let after_ws = lower.get(end..).map(leading_ws_len).unwrap_or_default();
       if before_ok && after_ws > 0 {
-        cut = cut.max(end.saturating_add(after_ws));
+        cut = cut.max(to_orig(end.saturating_add(after_ws)));
       }
     }
   }
@@ -1356,34 +1460,42 @@ fn trim_leading_clause(
       let end = start.saturating_add(prefix.len());
       search_from = end;
       let after_ws = lower.get(end..).map(leading_ws_len).unwrap_or_default();
+      let after_orig = to_orig(end.saturating_add(after_ws));
+      // The company name after the prefix must be capitalized. Read the
+      // original text (in original byte offsets), not the lowercased copy, or
+      // this check never passes.
       let after = text
-        .get(end.saturating_add(after_ws)..)
+        .get(after_orig..)
         .and_then(|suffix| suffix.chars().next());
       if after_ws == 0 || !after.is_some_and(char::is_uppercase) {
         continue;
       }
 
-      let before = text.get(..start).unwrap_or_default();
+      let before = text.get(..to_orig(start)).unwrap_or_default();
       let prefix_lower = prefix.to_lowercase();
       if data.comma_gated_direct_prefixes.contains(&prefix_lower) {
         let has_comma = before.trim_end().ends_with(',');
         let has_sentence_verb =
-          word_tokens(before, 0, before.len()).iter().any(|word| {
+          word_tokens(before, 0, before.len()).any(|word| {
             starts_lower(word.text)
               && data
                 .sentence_verb_indicators
-                .contains(&word.text.to_lowercase())
+                .contains(lowercase_lookup(word.text).as_ref())
           });
         if !has_comma && !has_sentence_verb {
           continue;
         }
       }
 
-      let words = word_tokens(before, 0, before.len());
-      let has_prose_prefix =
-        words.len() >= 3 && words.iter().any(|word| starts_lower(word.text));
+      let mut word_count = 0_usize;
+      let mut has_lower_word = false;
+      for word in word_tokens(before, 0, before.len()) {
+        word_count = word_count.saturating_add(1);
+        has_lower_word |= starts_lower(word.text);
+      }
+      let has_prose_prefix = word_count >= 3 && has_lower_word;
       if has_prose_prefix {
-        cut = cut.max(end.saturating_add(after_ws));
+        cut = cut.max(after_orig);
       }
     }
   }
@@ -1397,7 +1509,6 @@ fn trim_leading_clause(
     let ws = leading_ws_len(after);
     let candidate = after.get(ws..).unwrap_or_default();
     let upper_words = word_tokens(candidate, 0, candidate.len())
-      .into_iter()
       .filter(|word| starts_upper(word.text))
       .count();
     if upper_words >= 3 {
@@ -1406,6 +1517,25 @@ fn trim_leading_clause(
   }
 
   LeadingTrim { offset: cut }
+}
+
+/// Lowercase `text`, returning the folded string plus a table that maps each
+/// byte offset in the folded string back to the byte offset of the original
+/// character that produced it. The final entry maps the end of the folded
+/// string to `text.len()`. Case folding can change byte lengths, so offsets
+/// found in the folded copy must be translated through this table before they
+/// index or slice the original text.
+fn lowercase_with_offset_map(text: &str) -> (String, Vec<usize>) {
+  let mut lower = String::with_capacity(text.len());
+  let mut lower_to_orig = Vec::with_capacity(text.len().saturating_add(1));
+  for (orig_idx, ch) in text.char_indices() {
+    for folded in ch.to_lowercase() {
+      lower.push(folded);
+      lower_to_orig.resize(lower.len(), orig_idx);
+    }
+  }
+  lower_to_orig.push(text.len());
+  (lower, lower_to_orig)
 }
 
 fn find_word_at_boundary(haystack: &str, needle: &str) -> Option<usize> {
@@ -1484,6 +1614,19 @@ fn last_suffix_separator(text: &str) -> Option<usize> {
 
 fn clean_suffix(text: &str) -> String {
   text.chars().filter(|ch| !matches!(ch, '.' | ',')).collect()
+}
+
+fn is_roman_legal_suffix(text: &str) -> bool {
+  let suffix = clean_suffix(text);
+  !suffix.is_empty() && is_roman_numeral(&suffix)
+}
+
+fn list_suffixes(
+  data: &PreparedLegalFormData,
+) -> impl Iterator<Item = &str> + '_ {
+  data.list_suffix_indices.iter().filter_map(|index| {
+    data.suffixes.get(*index).map(std::string::String::as_str)
+  })
 }
 
 fn is_roman_numeral(text: &str) -> bool {
@@ -1597,7 +1740,7 @@ fn next_char(text: &str, pos: usize) -> Option<(usize, char)> {
     .map(|(relative, ch)| (pos.saturating_add(relative), ch))
 }
 
-fn lower_set(values: Vec<String>) -> BTreeSet<String> {
+fn lower_set(values: Vec<String>) -> HashSet<String> {
   values
     .into_iter()
     .filter(|value| !value.is_empty())
@@ -1611,4 +1754,125 @@ fn lower_vec(values: Vec<String>) -> Vec<String> {
     .filter(|value| !value.is_empty())
     .map(|value| value.to_lowercase())
     .collect()
+}
+
+fn lowercase_lookup(text: &str) -> Cow<'_, str> {
+  if text.chars().any(char::is_uppercase) {
+    Cow::Owned(text.to_lowercase())
+  } else {
+    Cow::Borrowed(text)
+  }
+}
+
+fn contains_lowercase(set: &HashSet<String>, text: &str) -> bool {
+  set.contains(lowercase_lookup(text).as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{
+    LegalFormData, PreparedLegalFormData, crosses_sentence_end,
+    trim_leading_clause,
+  };
+
+  fn leading_clause_data() -> PreparedLegalFormData {
+    PreparedLegalFormData::new(LegalFormData {
+      leading_clause_phrases: vec![
+        String::from("by and among"),
+        String::from("by and between"),
+        String::from("is between"),
+      ],
+      leading_clause_direct_prefixes: vec![
+        String::from("by"),
+        String::from("among"),
+        String::from("amongst"),
+        String::from("between"),
+      ],
+      comma_gated_direct_prefixes: vec![
+        String::from("among"),
+        String::from("amongst"),
+        String::from("between"),
+      ],
+      ..LegalFormData::default()
+    })
+  }
+
+  #[test]
+  fn comma_gated_prefix_trims_long_preamble() {
+    // A long comma-laden preamble before a comma-gated direct prefix must trim
+    // back to the company name, not drop the whole candidate. The capital-word
+    // check after the prefix has to read the original text, not the lowercased
+    // copy, or it never fires.
+    let data = leading_clause_data();
+    let text =
+      "Investment Agreement, dated as of March 9, 2020, among Twitter, Inc.";
+    let trim = trim_leading_clause(text, &data);
+    assert_eq!(text.get(trim.offset..), Some("Twitter, Inc."));
+  }
+
+  #[test]
+  fn direct_prefix_offset_survives_turkish_dotted_capital() {
+    // `to_lowercase()` expands "İ" (U+0130) to "i" + U+0307, so a byte offset
+    // taken from the lowercased copy drifts one byte past the original once an
+    // İ precedes the clause. The recovered company name must be sliced in
+    // original-text space: the Turkish input yields the same result as its
+    // ASCII twin, with no mis-slice, panic, or None-degradation.
+    let data = leading_clause_data();
+    let ascii = "Istanbul Holding A.S. Investment Agreement, dated as of March 9, 2020, among Twitter, Inc.";
+    let turkish = "İstanbul Holding A.Ş. Investment Agreement, dated as of March 9, 2020, among Twitter, Inc.";
+    let ascii_trim = trim_leading_clause(ascii, &data);
+    let turkish_trim = trim_leading_clause(turkish, &data);
+    assert_eq!(ascii.get(ascii_trim.offset..), Some("Twitter, Inc."));
+    assert_eq!(turkish.get(turkish_trim.offset..), Some("Twitter, Inc."));
+  }
+
+  #[test]
+  fn comma_gated_prefix_keeps_in_name_capitalised_word() {
+    // "Stand By Me LLC": "By" is capitalized and mid-name, and the text before
+    // it is not prose, so the direct prefix must not trim.
+    let data = leading_clause_data();
+    let text = "Stand By Me LLC";
+    let trim = trim_leading_clause(text, &data);
+    assert_eq!(trim.offset, 0);
+  }
+
+  fn crosses(text: &str, prefix: &str) -> bool {
+    // Treat the org candidate as spanning the whole text up to the trailing
+    // legal-form suffix (the caller passes walker_start and suffix_start).
+    let suffix_start = text.rfind(prefix).unwrap_or(text.len());
+    crosses_sentence_end(text, 0, suffix_start)
+  }
+
+  #[test]
+  fn compact_initials_are_not_a_sentence_break() {
+    // "J.P. Morgan Securities LLC" — the interior dot must not make "J.P."
+    // read as a two-letter acronym followed by a sentence end.
+    assert!(!crosses("J.P. Morgan Securities LLC", "LLC"));
+    assert!(!crosses("U.S. Robotics Corp LLC", "LLC"));
+  }
+
+  #[test]
+  fn dotted_geo_acronym_joins_like_a_name_initial() {
+    // A two-letter dotted acronym is structurally identical whether it is a
+    // geographic prefix ("U.S. Bancorp Inc.") or a person-name initial ("J.P.
+    // Morgan Securities LLC"). The recovered TypeScript detector absorbed both
+    // unconditionally (skipInitialsBackward: `(?:\p{Lu}\.\s?){2,}`, no
+    // known-acronym exception list), so "U.S. Beta LLC" joins the same way.
+    // Splitting it would regress the real "U.S. Bancorp"/"U.S. Robotics"
+    // orgs, which share the exact same shape.
+    assert!(!crosses("U.S. Beta LLC", "LLC"));
+    assert!(!crosses("U.S. Bancorp Inc.", "Inc."));
+  }
+
+  #[test]
+  fn spaced_initials_stay_a_single_candidate() {
+    assert!(!crosses("J. P. Morgan Securities LLC", "LLC"));
+  }
+
+  #[test]
+  fn genuine_sentence_break_still_detected() {
+    // A real 2+ letter word (any case) before ". " remains a boundary.
+    assert!(crosses("Price. LLC", "LLC"));
+    assert!(crosses("Acme INC. Beta LLC", "LLC"));
+  }
 }

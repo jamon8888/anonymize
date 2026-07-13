@@ -1,27 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
-import { createPipelineContext, runPipeline } from "../../index";
-import type { Dictionaries } from "../../types";
+import { detectNative } from "../native-detect";
 import { contractTestConfig } from "../contract-config";
 import { loadTestDictionaries } from "../load-dictionaries";
 
-let dictionaries: Dictionaries;
-const getDictionaries = async () => {
-  if (!dictionaries) dictionaries = await loadTestDictionaries();
-  return dictionaries;
-};
+const dictionaries = await loadTestDictionaries();
 
-const CONFIG = contractTestConfig("contract-quality-test");
+const CONFIG = { ...contractTestConfig("contract-quality-test"), dictionaries };
 
-const CONTEXT = createPipelineContext();
-
-const detect = async (text: string) =>
-  runPipeline({
-    fullText: text,
-    config: { ...CONFIG, dictionaries: await getDictionaries() },
-    gazetteerEntries: [],
-    context: CONTEXT,
-  });
+const detect = (text: string) => detectNative(CONFIG, text);
 
 describe("contract quality regressions", () => {
   test("keeps person names with middle initials", async () => {
@@ -213,6 +200,9 @@ describe("contract quality regressions", () => {
     ).toBe(false);
   });
 
+  // NATIVE-GAP: native address expansion stops at the "St." abbreviation and
+  // emits exactly "123 Main St"; it does not extend the span across the
+  // abbreviation dot into the "Suite 100" continuation.
   test("keeps address continuations after street abbreviations", async () => {
     const entities = await detect(
       "The employee is residing at 123 Main St. Suite 100.",
@@ -261,6 +251,11 @@ describe("contract quality regressions", () => {
     );
   });
 
+  // NATIVE-GAP: native misclassifies "J.P. Morgan Securities LLC" — it splits
+  // the span into person entities ("J.P. Morgan", "Morgan Securities LLC")
+  // rather than emitting the single organization. The other org names in this
+  // fixture (Twitter, X Holdings, Bank of America, Goldman Sachs & Co. LLC)
+  // resolve correctly natively.
   test("keeps Twitter merger agreement organization names stable", async () => {
     const entities = await detect(
       "THIS AGREEMENT AND PLAN OF MERGER, dated as of April 25, 2022, is made by and among Twitter, Inc., a Delaware corporation, X Holdings I, Inc., a Delaware corporation, X Holdings II, Inc., a Delaware corporation. " +

@@ -1,21 +1,32 @@
+use std::time::Instant;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyAny, PyBytes};
 use stella_anonymize_adapter_contract::{
   BindingOperatorConfig, BindingOperatorEntry, BindingPipelineEntity,
   BindingPreparedSearchConfig, BindingRedactionEntry, BindingRedactionResult,
-  BindingStaticRedactionResult, ContractError, operator_config_from_binding,
-  prepared_search_config_from_binding, prepared_search_core_package_to_bytes,
+  BindingStaticRedactionResult, ContractError,
+  PreparedSearchPackageDecodeTimings, assemble_static_search_config,
+  diagnostic_events_to_utf16_binding, diagnostic_stage_event,
+  operator_config_from_binding, prepared_search_config_from_binding,
+  prepared_search_core_package_to_bytes,
   prepared_search_core_package_to_compressed_bytes,
-  prepared_search_core_package_view_from_bytes,
-  prepared_search_package_from_bytes, prepared_search_package_has_core_payload,
+  prepared_search_core_package_view_from_bytes_with_timings,
+  prepared_search_core_package_view_trusted_from_bytes_with_timings,
+  prepared_search_package_decode_events, prepared_search_package_from_bytes,
+  prepared_search_package_has_core_payload,
   static_redaction_diagnostic_result_to_utf16_binding,
   static_redaction_diagnostics_to_binding, static_redaction_result_to_binding,
   static_redaction_result_to_utf16_binding,
+  static_redaction_stream_event_to_utf16_binding,
 };
 use stella_anonymize_core::{
-  PreparedSearch as CorePreparedSearch, PreparedSearchArtifacts,
-  StaticRedactionDiagnostics, StaticRedactionResult,
+  DiagnosticDetail, DiagnosticEvent, DiagnosticStage, Error as CoreError,
+  OperatorConfig, PreparedEngine as CorePreparedEngine,
+  PreparedEngineArtifactsView, StaticRedactionDiagnostics,
+  StaticRedactionResult,
+  assemble::{AssembleError, Dictionaries, GazetteerEntry, PipelineConfig},
 };
 
 #[pyclass(name = "RedactionEntry", get_all, skip_from_py_object)]
@@ -62,7 +73,7 @@ pub struct PyStaticRedactionResult {
 
 #[pyclass(name = "PreparedSearch")]
 pub struct PyPreparedSearch {
-  inner: CorePreparedSearch,
+  inner: CorePreparedEngine,
   prepare_diagnostics: StaticRedactionDiagnostics,
 }
 
@@ -71,7 +82,7 @@ impl PyPreparedSearch {
   #[new]
   fn new(config_json: &str) -> PyResult<Self> {
     let config = parse_core_prepared_search_config(config_json)?;
-    let result = CorePreparedSearch::new_with_diagnostics(config)
+    let result = CorePreparedEngine::new_with_diagnostics(config)
       .map_err(|error| to_py_core_error(&error))?;
     Ok(Self {
       inner: result.prepared,
@@ -85,54 +96,131 @@ impl PyPreparedSearch {
     artifact_bytes: &[u8],
   ) -> PyResult<Self> {
     let config = parse_core_prepared_search_config(config_json)?;
-    let artifacts = PreparedSearchArtifacts::from_bytes(artifact_bytes)
+    let artifact_decode_start = Instant::now();
+    let artifacts = PreparedEngineArtifactsView::from_bytes(artifact_bytes)
       .map_err(|error| to_py_core_error(&error))?;
-    let result =
-      CorePreparedSearch::new_with_artifacts_diagnostics(config, &artifacts)
-        .map_err(|error| to_py_core_error(&error))?;
+    let artifact_decode_elapsed = elapsed_us(artifact_decode_start);
+    let result = CorePreparedEngine::new_with_artifact_view_diagnostics(
+      config, &artifacts,
+    )
+    .map_err(|error| to_py_core_error(&error))?;
+    let mut diagnostics = StaticRedactionDiagnostics::default();
+    diagnostics.events.push(diagnostic_stage_event(
+      DiagnosticStage::PrepareArtifactsDecode,
+      None,
+      Some(artifact_decode_elapsed),
+      Some(artifact_bytes.len()),
+    ));
+    diagnostics.extend(result.diagnostics);
     Ok(Self {
       inner: result.prepared,
-      prepare_diagnostics: result.diagnostics,
+      prepare_diagnostics: diagnostics,
     })
   }
 
   #[staticmethod]
   fn from_prepared_package_bytes(package_bytes: &[u8]) -> PyResult<Self> {
     if prepared_search_package_has_core_payload(package_bytes) {
-      let package = prepared_search_core_package_view_from_bytes(package_bytes)
+      let package_decode_start = Instant::now();
+      let (package, package_decode_timings) =
+        prepared_search_core_package_view_from_bytes_with_timings(
+          package_bytes,
+        )
         .map_err(|error| to_py_contract_error(&error))?;
-      let artifacts =
-        PreparedSearchArtifacts::from_bytes(package.artifacts.as_ref())
-          .map_err(|error| to_py_core_error(&error))?;
-      let result = CorePreparedSearch::new_with_artifacts_diagnostics(
+      let package_decode_elapsed = elapsed_us(package_decode_start);
+      return Self::from_core_package(
         package.config,
-        &artifacts,
-      )
-      .map_err(|error| to_py_core_error(&error))?;
-      return Ok(Self {
-        inner: result.prepared,
-        prepare_diagnostics: result.diagnostics,
-      });
+        package.artifacts.as_bytes(),
+        package_decode_timings,
+        package_decode_elapsed,
+        package_bytes.len(),
+      );
     }
 
+    let package_decode_start = Instant::now();
     let package = prepared_search_package_from_bytes(package_bytes)
       .map_err(|error| to_py_contract_error(&error))?;
+    let package_decode_elapsed = elapsed_us(package_decode_start);
     let config = prepared_search_config_from_binding(package.config)
       .map_err(|error| to_py_contract_error(&error))?;
-    let artifacts = PreparedSearchArtifacts::from_bytes(&package.artifacts)
+    let artifact_decode_start = Instant::now();
+    let artifacts = PreparedEngineArtifactsView::from_bytes(&package.artifacts)
       .map_err(|error| to_py_core_error(&error))?;
-    let result =
-      CorePreparedSearch::new_with_artifacts_diagnostics(config, &artifacts)
-        .map_err(|error| to_py_core_error(&error))?;
+    let artifact_decode_elapsed = elapsed_us(artifact_decode_start);
+    let result = CorePreparedEngine::new_with_artifact_view_diagnostics(
+      config, &artifacts,
+    )
+    .map_err(|error| to_py_core_error(&error))?;
+    let mut diagnostics = package_prepare_diagnostics(
+      package_decode_elapsed,
+      PreparedSearchPackageDecodeTimings::default(),
+      package_bytes.len(),
+    );
+    diagnostics.events.push(diagnostic_stage_event(
+      DiagnosticStage::PrepareArtifactsDecode,
+      None,
+      Some(artifact_decode_elapsed),
+      Some(package.artifacts.len()),
+    ));
+    diagnostics.extend(result.diagnostics);
     Ok(Self {
       inner: result.prepared,
-      prepare_diagnostics: result.diagnostics,
+      prepare_diagnostics: diagnostics,
     })
+  }
+
+  #[staticmethod]
+  fn from_trusted_prepared_package_bytes(
+    package_bytes: &[u8],
+  ) -> PyResult<Self> {
+    if prepared_search_package_has_core_payload(package_bytes) {
+      let package_decode_start = Instant::now();
+      let (package, package_decode_timings) =
+        prepared_search_core_package_view_trusted_from_bytes_with_timings(
+          package_bytes,
+        )
+        .map_err(|error| to_py_contract_error(&error))?;
+      let package_decode_elapsed = elapsed_us(package_decode_start);
+      return Self::from_core_package(
+        package.config,
+        package.artifacts.as_bytes(),
+        package_decode_timings,
+        package_decode_elapsed,
+        package_bytes.len(),
+      );
+    }
+
+    Self::from_prepared_package_bytes(package_bytes)
+  }
+
+  #[staticmethod]
+  fn from_trusted_prepared_package_bytes_without_cache(
+    package_bytes: &[u8],
+  ) -> PyResult<Self> {
+    Self::from_trusted_prepared_package_bytes(package_bytes)
   }
 
   fn prepare_diagnostics_json(&self) -> PyResult<String> {
     let diagnostics =
       static_redaction_diagnostics_to_binding(self.prepare_diagnostics.clone());
+
+    serde_json::to_string(&diagnostics)
+      .map_err(|error| to_py_serde_error(&error))
+  }
+
+  fn warm_lazy_regex(&self) -> PyResult<()> {
+    self
+      .inner
+      .warm_lazy_regex()
+      .map_err(|error| to_py_core_error(&error))
+  }
+
+  fn warm_lazy_regex_diagnostics_json(&self) -> PyResult<String> {
+    let diagnostics = self
+      .inner
+      .warm_lazy_regex_diagnostics()
+      .map_err(|error| to_py_core_error(&error))?;
+    let diagnostics = static_redaction_diagnostics_to_binding(diagnostics);
 
     serde_json::to_string(&diagnostics)
       .map_err(|error| to_py_serde_error(&error))
@@ -160,18 +248,85 @@ impl PyPreparedSearch {
     serde_json::to_string(&result).map_err(|error| to_py_serde_error(&error))
   }
 
+  fn redact_static_entities_result_stream_json(
+    &self,
+    full_text: &str,
+    on_event: &Bound<'_, PyAny>,
+    operators_json: Option<&str>,
+  ) -> PyResult<String> {
+    let operators = parse_operator_config(operators_json)?;
+    let operators = operator_config_from_binding(operators)
+      .map_err(|error| to_py_contract_error(&error))?;
+    let result = self
+      .inner
+      .redact_static_entities_with_result_observer(
+        full_text,
+        &operators,
+        |event| {
+          let event_json = result_stream_event_json(event, full_text)?;
+          on_event
+            .call1((event_json,))
+            .map_err(|error| core_result_observer_error(error.to_string()))?;
+          Ok(())
+        },
+      )
+      .map_err(|error| to_py_core_error(&error))?;
+    let result = static_redaction_result_to_utf16_binding(result, full_text)
+      .map_err(|error| to_py_contract_error(&error))?;
+
+    serde_json::to_string(&result).map_err(|error| to_py_serde_error(&error))
+  }
+
   fn redact_static_entities_diagnostics_json(
     &self,
     full_text: &str,
     operators_json: Option<&str>,
   ) -> PyResult<String> {
     let operators = parse_operator_config(operators_json)?;
+    self.redact_static_entities_diagnostics_json_inner(
+      full_text,
+      &operator_config_from_binding(operators)
+        .map_err(|error| to_py_contract_error(&error))?,
+      DiagnosticDetail::Detailed,
+    )
+  }
+
+  fn redact_static_entities_summary_diagnostics_json(
+    &self,
+    full_text: &str,
+    operators_json: Option<&str>,
+  ) -> PyResult<String> {
+    let operators = parse_operator_config(operators_json)?;
+    self.redact_static_entities_diagnostics_json_inner(
+      full_text,
+      &operator_config_from_binding(operators)
+        .map_err(|error| to_py_contract_error(&error))?,
+      DiagnosticDetail::Summary,
+    )
+  }
+
+  fn redact_static_entities_diagnostics_stream_json(
+    &self,
+    full_text: &str,
+    on_batch: &Bound<'_, PyAny>,
+    operators_json: Option<&str>,
+  ) -> PyResult<String> {
+    let operators = parse_operator_config(operators_json)?;
+    let operators = operator_config_from_binding(operators)
+      .map_err(|error| to_py_contract_error(&error))?;
+    emit_prepare_diagnostics_batch(&self.prepare_diagnostics, on_batch)?;
     let mut result = self
       .inner
-      .redact_static_entities_with_diagnostics(
+      .redact_static_entities_with_diagnostics_observer(
         full_text,
-        &operator_config_from_binding(operators)
-          .map_err(|error| to_py_contract_error(&error))?,
+        &operators,
+        |events| {
+          let batch_json = diagnostic_event_batch_json(events, full_text)?;
+          on_batch
+            .call1((batch_json,))
+            .map_err(|error| core_observer_error(error.to_string()))?;
+          Ok(())
+        },
       )
       .map_err(|error| to_py_core_error(&error))?;
     let mut diagnostics = self.prepare_diagnostics.clone();
@@ -186,6 +341,64 @@ impl PyPreparedSearch {
 }
 
 impl PyPreparedSearch {
+  fn from_core_package(
+    config: stella_anonymize_core::PreparedEngineConfig,
+    artifact_bytes: &[u8],
+    package_decode_timings: PreparedSearchPackageDecodeTimings,
+    package_decode_elapsed: u64,
+    input_bytes_len: usize,
+  ) -> PyResult<Self> {
+    let artifact_decode_start = Instant::now();
+    let artifacts = PreparedEngineArtifactsView::from_bytes(artifact_bytes)
+      .map_err(|error| to_py_core_error(&error))?;
+    let artifact_decode = elapsed_us(artifact_decode_start);
+    let result = CorePreparedEngine::new_with_artifact_view_diagnostics(
+      config, &artifacts,
+    )
+    .map_err(|error| to_py_core_error(&error))?;
+    let mut diagnostics = package_prepare_diagnostics(
+      package_decode_elapsed,
+      package_decode_timings,
+      input_bytes_len,
+    );
+    diagnostics.events.push(diagnostic_stage_event(
+      DiagnosticStage::PrepareArtifactsDecode,
+      None,
+      Some(artifact_decode),
+      Some(artifact_bytes.len()),
+    ));
+    diagnostics.extend(result.diagnostics);
+    Ok(Self {
+      inner: result.prepared,
+      prepare_diagnostics: diagnostics,
+    })
+  }
+
+  fn redact_static_entities_diagnostics_json_inner(
+    &self,
+    full_text: &str,
+    operators: &OperatorConfig,
+    detail: DiagnosticDetail,
+  ) -> PyResult<String> {
+    let mut result = match detail {
+      DiagnosticDetail::Detailed => self
+        .inner
+        .redact_static_entities_with_diagnostics(full_text, operators),
+      DiagnosticDetail::Summary => self
+        .inner
+        .redact_static_entities_with_summary_diagnostics(full_text, operators),
+    }
+    .map_err(|error| to_py_core_error(&error))?;
+    let mut diagnostics = self.prepare_diagnostics.clone();
+    diagnostics.extend(result.diagnostics);
+    result.diagnostics = diagnostics;
+    let result =
+      static_redaction_diagnostic_result_to_utf16_binding(result, full_text)
+        .map_err(|error| to_py_contract_error(&error))?;
+
+    serde_json::to_string(&result).map_err(|error| to_py_serde_error(&error))
+  }
+
   fn redact_static_entities_core(
     &self,
     full_text: &str,
@@ -203,6 +416,89 @@ impl PyPreparedSearch {
   }
 }
 
+fn package_prepare_diagnostics(
+  package_decode_elapsed: u64,
+  package_decode_timings: PreparedSearchPackageDecodeTimings,
+  input_bytes_len: usize,
+) -> StaticRedactionDiagnostics {
+  StaticRedactionDiagnostics {
+    events: prepared_search_package_decode_events(
+      package_decode_elapsed,
+      package_decode_timings,
+      input_bytes_len,
+    ),
+    ..StaticRedactionDiagnostics::default()
+  }
+}
+
+fn elapsed_us(start: Instant) -> u64 {
+  let micros = start.elapsed().as_micros();
+  u64::try_from(micros).unwrap_or(u64::MAX)
+}
+
+fn emit_prepare_diagnostics_batch(
+  diagnostics: &StaticRedactionDiagnostics,
+  on_batch: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+  if diagnostics.events.is_empty() {
+    return Ok(());
+  }
+  let diagnostics =
+    static_redaction_diagnostics_to_binding(diagnostics.clone());
+  let batch_json = serde_json::to_string(&diagnostics)
+    .map_err(|error| to_py_serde_error(&error))?;
+  on_batch.call1((batch_json,))?;
+  Ok(())
+}
+
+fn diagnostic_event_batch_json(
+  events: &[DiagnosticEvent],
+  full_text: &str,
+) -> stella_anonymize_core::Result<String> {
+  let diagnostics = diagnostic_events_to_utf16_binding(events, full_text)
+    .map_err(|error| {
+      core_observer_error(format!(
+        "diagnostic batch conversion failed: {error}"
+      ))
+    })?;
+  serde_json::to_string(&diagnostics).map_err(|error| {
+    core_observer_error(format!(
+      "diagnostic batch serialization failed: {error}"
+    ))
+  })
+}
+
+fn result_stream_event_json(
+  event: stella_anonymize_core::StaticRedactionStreamEvent<'_>,
+  full_text: &str,
+) -> stella_anonymize_core::Result<String> {
+  let event = static_redaction_stream_event_to_utf16_binding(event, full_text)
+    .map_err(|error| {
+      core_result_observer_error(format!(
+        "result event conversion failed: {error}"
+      ))
+    })?;
+  serde_json::to_string(&event).map_err(|error| {
+    core_result_observer_error(format!(
+      "result event serialization failed: {error}"
+    ))
+  })
+}
+
+const fn core_result_observer_error(reason: String) -> CoreError {
+  CoreError::InvalidStaticData {
+    field: "result.observer",
+    reason,
+  }
+}
+
+const fn core_observer_error(reason: String) -> CoreError {
+  CoreError::InvalidStaticData {
+    field: "diagnostics.observer",
+    reason,
+  }
+}
+
 #[pyfunction]
 fn redact_static_entities_json(
   config_json: &str,
@@ -214,12 +510,27 @@ fn redact_static_entities_json(
 }
 
 #[pyfunction]
+fn redact_static_entities_result_stream_json(
+  config_json: &str,
+  full_text: &str,
+  on_event: &Bound<'_, PyAny>,
+  operators_json: Option<&str>,
+) -> PyResult<String> {
+  let prepared = PyPreparedSearch::new(config_json)?;
+  prepared.redact_static_entities_result_stream_json(
+    full_text,
+    on_event,
+    operators_json,
+  )
+}
+
+#[pyfunction]
 fn prepare_static_search_artifacts_bytes<'py>(
   py: Python<'py>,
   config_json: &str,
 ) -> PyResult<Bound<'py, PyBytes>> {
   let config = parse_core_prepared_search_config(config_json)?;
-  let bytes = CorePreparedSearch::prepare_artifacts(config)
+  let bytes = CorePreparedEngine::prepare_artifacts(config)
     .and_then(|artifacts| artifacts.to_bytes())
     .map_err(|error| to_py_core_error(&error))?;
   Ok(PyBytes::new(py, &bytes))
@@ -249,16 +560,124 @@ fn prepare_static_search_package_bytes_with<'py>(
   let binding_config = parse_prepared_search_config(config_json)?;
   let core_config = prepared_search_config_from_binding(binding_config)
     .map_err(|error| to_py_contract_error(&error))?;
-  let artifacts = CorePreparedSearch::prepare_artifacts(core_config.clone())
-    .and_then(|artifacts| artifacts.to_bytes())
-    .map_err(|error| to_py_core_error(&error))?;
+  let artifact_bytes =
+    CorePreparedEngine::prepare_artifacts(core_config.clone())
+      .and_then(|artifacts| artifacts.to_bytes())
+      .map_err(|error| to_py_core_error(&error))?;
   let package = if compressed {
-    prepared_search_core_package_to_compressed_bytes(&core_config, &artifacts)
+    prepared_search_core_package_to_compressed_bytes(
+      &core_config,
+      &artifact_bytes,
+    )
   } else {
-    prepared_search_core_package_to_bytes(&core_config, &artifacts)
+    prepared_search_core_package_to_bytes(&core_config, &artifact_bytes)
   };
   let bytes = package.map_err(|error| to_py_contract_error(&error))?;
   Ok(PyBytes::new(py, &bytes))
+}
+
+/// Assembles a prepared static-search config from a pipeline config plus
+/// out-of-band dictionaries / gazetteer JSON, returning the assembled config as
+/// JSON. Mirrors the napi `assembleStaticSearchConfigJson`.
+#[pyfunction]
+fn assemble_static_search_config_json(
+  pipeline_config_json: &str,
+  dictionaries_json: Option<&str>,
+  gazetteer_json: Option<&str>,
+) -> PyResult<String> {
+  let config = assemble_binding_config(
+    pipeline_config_json,
+    dictionaries_json,
+    gazetteer_json,
+  )?;
+  serde_json::to_string(&config).map_err(|error| to_py_serde_error(&error))
+}
+
+/// Assembles the config and chains it through the prepare/package path,
+/// returning ready-to-load core package bytes. Mirrors the napi
+/// `assembleStaticSearchPackageBytes`.
+#[pyfunction]
+fn assemble_static_search_package_bytes<'py>(
+  py: Python<'py>,
+  pipeline_config_json: &str,
+  dictionaries_json: Option<&str>,
+  gazetteer_json: Option<&str>,
+) -> PyResult<Bound<'py, PyBytes>> {
+  assemble_static_search_package_bytes_with(
+    py,
+    pipeline_config_json,
+    dictionaries_json,
+    gazetteer_json,
+    false,
+  )
+}
+
+/// Compressed counterpart of [`assemble_static_search_package_bytes`]. Mirrors
+/// the napi `assembleStaticSearchCompressedPackageBytes`.
+#[pyfunction]
+fn assemble_static_search_compressed_package_bytes<'py>(
+  py: Python<'py>,
+  pipeline_config_json: &str,
+  dictionaries_json: Option<&str>,
+  gazetteer_json: Option<&str>,
+) -> PyResult<Bound<'py, PyBytes>> {
+  assemble_static_search_package_bytes_with(
+    py,
+    pipeline_config_json,
+    dictionaries_json,
+    gazetteer_json,
+    true,
+  )
+}
+
+fn assemble_static_search_package_bytes_with<'py>(
+  py: Python<'py>,
+  pipeline_config_json: &str,
+  dictionaries_json: Option<&str>,
+  gazetteer_json: Option<&str>,
+  compressed: bool,
+) -> PyResult<Bound<'py, PyBytes>> {
+  let binding_config = assemble_binding_config(
+    pipeline_config_json,
+    dictionaries_json,
+    gazetteer_json,
+  )?;
+  let core_config = prepared_search_config_from_binding(binding_config)
+    .map_err(|error| to_py_contract_error(&error))?;
+  let artifact_bytes =
+    CorePreparedEngine::prepare_artifacts(core_config.clone())
+      .and_then(|artifacts| artifacts.to_bytes())
+      .map_err(|error| to_py_core_error(&error))?;
+  let package = if compressed {
+    prepared_search_core_package_to_compressed_bytes(
+      &core_config,
+      &artifact_bytes,
+    )
+  } else {
+    prepared_search_core_package_to_bytes(&core_config, &artifact_bytes)
+  };
+  let bytes = package.map_err(|error| to_py_contract_error(&error))?;
+  Ok(PyBytes::new(py, &bytes))
+}
+
+fn assemble_binding_config(
+  pipeline_config_json: &str,
+  dictionaries_json: Option<&str>,
+  gazetteer_json: Option<&str>,
+) -> PyResult<BindingPreparedSearchConfig> {
+  let config = serde_json::from_str::<PipelineConfig>(pipeline_config_json)
+    .map_err(|error| to_py_serde_error(&error))?;
+  let dictionaries = dictionaries_json
+    .map(serde_json::from_str::<Dictionaries>)
+    .transpose()
+    .map_err(|error| to_py_serde_error(&error))?;
+  let gazetteer = gazetteer_json
+    .map(serde_json::from_str::<Vec<GazetteerEntry>>)
+    .transpose()
+    .map_err(|error| to_py_serde_error(&error))?
+    .unwrap_or_default();
+  assemble_static_search_config(&config, dictionaries.as_ref(), &gazetteer)
+    .map_err(|error| to_py_assemble_error(&error))
 }
 
 #[pyfunction]
@@ -269,6 +688,17 @@ fn redact_static_entities_diagnostics_json(
 ) -> PyResult<String> {
   let prepared = PyPreparedSearch::new(config_json)?;
   prepared.redact_static_entities_diagnostics_json(full_text, operators_json)
+}
+
+#[pyfunction]
+fn redact_static_entities_summary_diagnostics_json(
+  config_json: &str,
+  full_text: &str,
+  operators_json: Option<&str>,
+) -> PyResult<String> {
+  let prepared = PyPreparedSearch::new(config_json)?;
+  prepared
+    .redact_static_entities_summary_diagnostics_json(full_text, operators_json)
 }
 
 #[pyfunction]
@@ -290,7 +720,7 @@ fn parse_prepared_search_config(
 
 fn parse_core_prepared_search_config(
   config_json: &str,
-) -> PyResult<stella_anonymize_core::PreparedSearchConfig> {
+) -> PyResult<stella_anonymize_core::PreparedEngineConfig> {
   prepared_search_config_from_binding(parse_prepared_search_config(
     config_json,
   )?)
@@ -448,8 +878,12 @@ fn to_py_serde_error(error: &serde_json::Error) -> PyErr {
   PyValueError::new_err(error.to_string())
 }
 
+fn to_py_assemble_error(error: &AssembleError) -> PyErr {
+  PyValueError::new_err(error.to_string())
+}
+
 #[pymodule(gil_used = false)]
-fn stella_anonymize_core_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
   module.add_class::<PyPreparedSearch>()?;
   module.add_class::<PyStaticRedactionResult>()?;
   module.add_class::<PyRedactionResult>()?;
@@ -458,6 +892,10 @@ fn stella_anonymize_core_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
   module.add_class::<PyPipelineEntity>()?;
   module
     .add_function(wrap_pyfunction!(redact_static_entities_json, module)?)?;
+  module.add_function(wrap_pyfunction!(
+    redact_static_entities_result_stream_json,
+    module
+  )?)?;
   module.add_function(wrap_pyfunction!(
     prepare_static_search_artifacts_bytes,
     module
@@ -471,7 +909,23 @@ fn stella_anonymize_core_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module
   )?)?;
   module.add_function(wrap_pyfunction!(
+    assemble_static_search_config_json,
+    module
+  )?)?;
+  module.add_function(wrap_pyfunction!(
+    assemble_static_search_package_bytes,
+    module
+  )?)?;
+  module.add_function(wrap_pyfunction!(
+    assemble_static_search_compressed_package_bytes,
+    module
+  )?)?;
+  module.add_function(wrap_pyfunction!(
     redact_static_entities_diagnostics_json,
+    module
+  )?)?;
+  module.add_function(wrap_pyfunction!(
+    redact_static_entities_summary_diagnostics_json,
     module
   )?)?;
   module.add_function(wrap_pyfunction!(normalize_for_search, module)?)?;

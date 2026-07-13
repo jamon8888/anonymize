@@ -1,15 +1,18 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+mod support;
+
 use std::collections::BTreeSet;
 
 use stella_anonymize_core::{
   DenyListFilterData, DenyListMatchData, OperatorConfig, PatternSlice,
-  PreparedSearch, PreparedSearchConfig, PreparedSearchSlices, RegexMatchMeta,
+  PreparedEngine, PreparedEngineConfig, PreparedEngineSlices, RegexMatchMeta,
   SearchOptions, SearchPattern, TriggerData, TriggerRule, TriggerStrategy,
 };
+use support::prepared_config;
 
-fn empty_config(slices: PreparedSearchSlices) -> PreparedSearchConfig {
-  PreparedSearchConfig {
+fn empty_config(slices: PreparedEngineSlices) -> PreparedEngineConfig {
+  prepared_config! {
     regex_patterns: vec![],
     custom_regex_patterns: vec![],
     literal_patterns: vec![],
@@ -19,7 +22,7 @@ fn empty_config(slices: PreparedSearchSlices) -> PreparedSearchConfig {
     allowed_labels: vec![],
     threshold: 0.0,
     confidence_boost: false,
-    slices,
+    slices: slices,
     regex_meta: vec![],
     custom_regex_meta: vec![],
     deny_list_data: None,
@@ -34,6 +37,7 @@ fn empty_config(slices: PreparedSearchSlices) -> PreparedSearchConfig {
     address_context_data: None,
     coreference_data: None,
     name_corpus_data: None,
+    signature_data: None,
     date_data: None,
     monetary_data: None,
   }
@@ -44,6 +48,7 @@ fn empty_deny_list_data(filters: DenyListFilterData) -> DenyListMatchData {
     labels: Vec::<Vec<String>>::new().into(),
     custom_labels: Vec::<Vec<String>>::new().into(),
     originals: vec![],
+    pattern_meta: stella_anonymize_core::DenyListPatternMetaSet::default(),
     sources: Vec::<Vec<String>>::new().into(),
     filters: Some(filters),
   }
@@ -53,7 +58,7 @@ fn set<const N: usize>(values: [&str; N]) -> BTreeSet<String> {
   values.into_iter().map(String::from).collect()
 }
 
-fn resolved_texts(prepared: &PreparedSearch, text: &str) -> Vec<String> {
+fn resolved_texts(prepared: &PreparedEngine, text: &str) -> Vec<String> {
   prepared
     .redact_static_entities(text, &OperatorConfig::default())
     .unwrap()
@@ -65,15 +70,15 @@ fn resolved_texts(prepared: &PreparedSearch, text: &str) -> Vec<String> {
 
 #[test]
 fn keeps_trigger_address_with_extra_component_anchor() {
-  let prepared = PreparedSearch::new(PreparedSearchConfig {
+  let prepared = PreparedEngine::new(prepared_config! {
     regex_patterns: vec![SearchPattern::LiteralWithOptions {
       pattern: String::from("bytem"),
       case_insensitive: Some(true),
       whole_words: Some(true),
     }],
-    slices: PreparedSearchSlices {
+    slices: PreparedEngineSlices {
       triggers: PatternSlice { start: 0, end: 1 },
-      ..PreparedSearchSlices::default()
+      ..PreparedEngineSlices::default()
     },
     trigger_data: Some(TriggerData {
       rules: vec![TriggerRule {
@@ -90,12 +95,15 @@ fn keeps_trigger_address_with_extra_component_anchor() {
       legal_form_suffixes: Vec::new(),
       post_nominals: Vec::new(),
       sentence_terminal_currency_terms: Vec::new(),
+      phone_extension_labels: Vec::new(),
+      number_markers: Vec::new(),
+      number_labels: Vec::new(),
     }),
     deny_list_data: Some(empty_deny_list_data(DenyListFilterData {
       address_component_terms: set(["sídliště"]),
       ..DenyListFilterData::default()
     })),
-    ..empty_config(PreparedSearchSlices::default())
+    ..empty_config(PreparedEngineSlices::default())
   })
   .unwrap();
 
@@ -107,18 +115,18 @@ fn keeps_trigger_address_with_extra_component_anchor() {
 
 #[test]
 fn rejects_non_trigger_numbers_after_number_abbreviations() {
-  let prepared = PreparedSearch::new(PreparedSearchConfig {
+  let prepared = PreparedEngine::new(prepared_config! {
     regex_patterns: vec![SearchPattern::Regex(String::from(r"\b\d{4}\b"))],
-    slices: PreparedSearchSlices {
+    slices: PreparedEngineSlices {
       regex: PatternSlice { start: 0, end: 1 },
-      ..PreparedSearchSlices::default()
+      ..PreparedEngineSlices::default()
     },
     regex_meta: vec![RegexMatchMeta::new("registration number", 0.9)],
     deny_list_data: Some(empty_deny_list_data(DenyListFilterData {
       number_abbrev_prefixes: set(["no.", "č.", "nr."]),
       ..DenyListFilterData::default()
     })),
-    ..empty_config(PreparedSearchSlices::default())
+    ..empty_config(PreparedEngineSlices::default())
   })
   .unwrap();
 
@@ -129,13 +137,13 @@ fn rejects_non_trigger_numbers_after_number_abbreviations() {
 
 #[test]
 fn rejects_document_structure_heading_organizations() {
-  let prepared = PreparedSearch::new(PreparedSearchConfig {
+  let prepared = PreparedEngine::new(prepared_config! {
     regex_patterns: vec![SearchPattern::Regex(String::from(
       r"Schedule No\. 4|Příloha č\. 2|Acme No\. 4",
     ))],
-    slices: PreparedSearchSlices {
+    slices: PreparedEngineSlices {
       regex: PatternSlice { start: 0, end: 1 },
-      ..PreparedSearchSlices::default()
+      ..PreparedEngineSlices::default()
     },
     regex_meta: vec![RegexMatchMeta::new("organization", 0.9)],
     deny_list_data: Some(empty_deny_list_data(DenyListFilterData {
@@ -143,7 +151,7 @@ fn rejects_document_structure_heading_organizations() {
       document_heading_ordinal_markers: set(["no.", "č."]),
       ..DenyListFilterData::default()
     })),
-    ..empty_config(PreparedSearchSlices::default())
+    ..empty_config(PreparedEngineSlices::default())
   })
   .unwrap();
 
@@ -157,13 +165,13 @@ fn rejects_document_structure_heading_organizations() {
 
 #[test]
 fn rejects_document_headings_without_deny_list_matching() {
-  let prepared = PreparedSearch::new(PreparedSearchConfig {
+  let prepared = PreparedEngine::new(prepared_config! {
     regex_patterns: vec![SearchPattern::Regex(String::from(
       r"Schedule No\. 4|Acme No\. 4",
     ))],
-    slices: PreparedSearchSlices {
+    slices: PreparedEngineSlices {
       regex: PatternSlice { start: 0, end: 1 },
-      ..PreparedSearchSlices::default()
+      ..PreparedEngineSlices::default()
     },
     regex_meta: vec![RegexMatchMeta::new("organization", 0.9)],
     false_positive_filters: Some(DenyListFilterData {
@@ -171,7 +179,7 @@ fn rejects_document_headings_without_deny_list_matching() {
       document_heading_ordinal_markers: set(["no."]),
       ..DenyListFilterData::default()
     }),
-    ..empty_config(PreparedSearchSlices::default())
+    ..empty_config(PreparedEngineSlices::default())
   })
   .unwrap();
 
@@ -183,15 +191,15 @@ fn rejects_document_headings_without_deny_list_matching() {
 
 #[test]
 fn rejects_only_ambiguous_street_type_trigger_addresses() {
-  let prepared = PreparedSearch::new(PreparedSearchConfig {
+  let prepared = PreparedEngine::new(prepared_config! {
     regex_patterns: vec![SearchPattern::LiteralWithOptions {
       pattern: String::from("demeurant"),
       case_insensitive: Some(true),
       whole_words: Some(true),
     }],
-    slices: PreparedSearchSlices {
+    slices: PreparedEngineSlices {
       triggers: PatternSlice { start: 0, end: 1 },
-      ..PreparedSearchSlices::default()
+      ..PreparedEngineSlices::default()
     },
     trigger_data: Some(TriggerData {
       rules: vec![TriggerRule {
@@ -208,13 +216,16 @@ fn rejects_only_ambiguous_street_type_trigger_addresses() {
       legal_form_suffixes: Vec::new(),
       post_nominals: Vec::new(),
       sentence_terminal_currency_terms: Vec::new(),
+      phone_extension_labels: Vec::new(),
+      number_markers: Vec::new(),
+      number_labels: Vec::new(),
     }),
     deny_list_data: Some(empty_deny_list_data(DenyListFilterData {
       street_types: set(["cours"]),
       ambiguous_street_type_terms: set(["cours"]),
       ..DenyListFilterData::default()
     })),
-    ..empty_config(PreparedSearchSlices::default())
+    ..empty_config(PreparedEngineSlices::default())
   })
   .unwrap();
 

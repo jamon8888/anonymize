@@ -13,6 +13,7 @@ axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 gliner2_inference = { git = "https://github.com/SemplificaAI/gliner2-rs", tag = "v0.5.1" }
 ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray", "half"] }
+ort-sys = "=2.0.0-rc.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

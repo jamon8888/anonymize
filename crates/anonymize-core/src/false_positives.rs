@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -76,6 +77,31 @@ fn normalize_entity(
       trim_trailing_address_prose(address_text, filters)
     {
       end_byte = start_byte.saturating_add(trimmed_end);
+    }
+  }
+
+  if entity.label == ORGANIZATION_LABEL
+    && matches!(
+      entity.source,
+      DetectionSource::Trigger | DetectionSource::Coreference
+    )
+  {
+    let org_text = slice(&raw_text, start_byte, end_byte)?;
+    // An open-ended trigger org (to-next-comma with no comma before the
+    // sentence end) captures the court/company name plus trailing sentence
+    // prose ("Conseil de prud'hommes des Sables-d'Olonne a rendu son
+    // jugement"). Left whole it trips the open-ended word-count guard and the
+    // whole entity is dropped. When it exceeds the guard, trim the trailing
+    // lowercase prose back to the last capitalized token (the proper-noun
+    // core) so the name survives. Gated on the same word cap, so shorter orgs
+    // that already pass are never touched.
+    if word_count(org_text) > MAX_OPEN_ENDED_ORGANIZATION_WORDS
+      && let Some(cut) = trim_open_ended_org_prose(
+        org_text,
+        filters.map(|filters| &filters.sentence_starters),
+      )
+    {
+      end_byte = start_byte.saturating_add(cut);
     }
   }
 
@@ -567,13 +593,37 @@ fn trim_trailing_address_prose(
     if !before.chars().any(|candidate| candidate.is_ascii_digit()) {
       continue;
     }
-    if text_ends_with_address_component(before.trim_end(), filters) {
-      continue;
-    }
     let after = text
       .get(index.saturating_add('.'.len_utf8())..)?
       .trim_start();
-    if after.len() < 5 || has_address_component(after, filters) {
+
+    // The current period may be the trailing dot of a street abbreviation
+    // ("123 Main St." -> "Suite 100"). Street types are stored dotted ("st."),
+    // so `before` (which excludes this dot) never matches; include the dot so
+    // the abbreviation is recognized as an address component. Full street
+    // names ("Street") already match on `before`.
+    let before_with_dot = text
+      .get(..index.saturating_add('.'.len_utf8()))
+      .unwrap_or(before);
+    if text_ends_with_address_component(before_with_dot, filters) {
+      // Dotted abbreviation ("St."). The period is only the abbreviation's own
+      // dot when a unit/address continuation follows ("Suite 100"); otherwise
+      // it is a real sentence boundary and trailing prose must be trimmed. Keep
+      // the abbreviation dot in the retained span.
+      if is_unit_or_address_continuation(after, filters) {
+        continue;
+      }
+      if after.chars().next().is_some_and(char::is_uppercase) {
+        return Some(before_with_dot.len());
+      }
+      continue;
+    }
+    if text_ends_with_address_component(before.trim_end(), filters) {
+      // Full street name ("Street") preceding a hard address anchor: the
+      // street name is never a sentence boundary here.
+      continue;
+    }
+    if is_unit_or_address_continuation(after, filters) {
       continue;
     }
     if after.chars().next().is_some_and(char::is_uppercase) {
@@ -581,6 +631,80 @@ fn trim_trailing_address_prose(
     }
   }
   None
+}
+
+/// A period followed by `after` is not a sentence break when `after` opens a
+/// short fragment, carries an address component, or reads as a unit designator
+/// plus identifier ("Suite 100", "Apt 4B") rather than a new prose sentence.
+fn is_unit_or_address_continuation(
+  after: &str,
+  filters: &DenyListFilterData,
+) -> bool {
+  after.len() < 5
+    || has_address_component(after, filters)
+    || starts_with_unit_number(after)
+}
+
+/// Recognized unit designators, matched case-insensitively with an optional
+/// trailing dot ("Ste." -> "ste"). The prepared address data carries dotted
+/// unit abbreviations (`packages/data/config/address-unit-abbreviations.json`),
+/// but that set feeds the address-seed expansion, is not threaded into this
+/// false-positive filter, and only covers a few dotted English spellings. This
+/// filter also needs the common un-dotted forms, so keep a small named set here
+/// per the repo's named-constants rule.
+const UNIT_DESIGNATORS: &[&str] = &[
+  "suite",
+  "ste",
+  "apt",
+  "apartment",
+  "unit",
+  "floor",
+  "fl",
+  "bldg",
+  "building",
+  "room",
+  "rm",
+  "no",
+];
+
+/// True when `text` opens with a recognized unit designator ("Suite", "Apt",
+/// "Unit", ...) immediately followed by a short unit identifier: digit-leading
+/// ("Suite 100", "Unit 5", "Apt 4B") or a short alphanumeric letter code
+/// ("Suite A", "Unit B2"). Prose sentences ("The tenant shall ...") and
+/// capitalized headings that merely precede a number ("Section 2 applies")
+/// fail because their first token is not a designator; prose after a real
+/// designator ("Suite The") fails the short-identifier shape.
+fn starts_with_unit_number(text: &str) -> bool {
+  let mut words = text.split_whitespace();
+  let Some(first) = words.next() else {
+    return false;
+  };
+  let designator = first.trim_end_matches('.');
+  if !UNIT_DESIGNATORS
+    .iter()
+    .any(|known| designator.eq_ignore_ascii_case(known))
+  {
+    return false;
+  }
+  words.next().is_some_and(is_unit_identifier)
+}
+
+/// A unit identifier after a designator: digit-leading of any length, or a
+/// short (<= 3 chars) alphanumeric code such as "A" or "B2".
+fn is_unit_identifier(word: &str) -> bool {
+  let token = word.trim_end_matches([',', '.', ';']);
+  let mut chars = token.chars();
+  let Some(head) = chars.next() else {
+    return false;
+  };
+  if head.is_ascii_digit() {
+    return true;
+  }
+  // Letter codes: a single letter ("Suite A") or letter + digits ("Unit B2").
+  // Requiring digits after the letter keeps prose words ("Suite The") out.
+  head.is_ascii_alphabetic()
+    && token.chars().count() <= 3
+    && chars.all(|ch| ch.is_ascii_digit())
 }
 
 fn has_address_component(text: &str, filters: &DenyListFilterData) -> bool {
@@ -754,6 +878,165 @@ fn first_word(text: &str) -> Option<(usize, &str)> {
   text.get(..end).map(|word| (end, word))
 }
 
+/// Lowercase tokens that link proper-noun parts inside an organization or
+/// institution name ("Bank of the West", "Tribunal de commerce des ...").
+/// They never mark the transition from the name to trailing clause prose, so
+/// they must not arm the sentence-starter stop in `trim_open_ended_org_prose`.
+/// Kept as a small fixed const here (with `sentence_starters` staying in the
+/// per-language `DenyListFilterData`) because this is stable cross-language
+/// name grammar rather than tunable deny-list data, mirroring the
+/// unit-designator decision for address trimming.
+const IN_NAME_CONNECTORS: &[&str] = &[
+  "of", "de", "des", "du", "da", "la", "le", "von", "van", "and", "und", "&",
+];
+
+/// Byte offset just past the last capitalized token that belongs to the leading
+/// organization name. Scanning records capitalized tokens as the retained span
+/// and stops at a lowercase sentence-starter (`the`, `for`, `by`, ...) that
+/// marks the transition from the name to trailing clause prose, so a
+/// capitalized defined term later in the sentence ("... shall provide the
+/// Services ...") is not mistaken for the name's tail.
+///
+/// The starter-stop is *armed* only after the scan has passed at least one
+/// lowercase token that is neither a sentence-starter nor an in-name connector
+/// (see `IN_NAME_CONNECTORS`). An in-name article that appears before any prose
+/// ("Bank of **the** West National Association") therefore does not cut the
+/// name: it arrives unarmed. A run of lowercase connector words inside the name
+/// ("Tribunal de commerce des Sables-d'Olonne") is likewise preserved. Returns
+/// `Some` only when trailing content follows the retained span, so callers can
+/// trim it off.
+fn trim_open_ended_org_prose(
+  text: &str,
+  sentence_starters: Option<&BTreeSet<String>>,
+) -> Option<usize> {
+  let mut last_capital_end = None::<usize>;
+  let mut word_start = None::<usize>;
+  let mut word_is_capital = false;
+  let mut armed = false;
+  let mut prev_word = None::<&str>;
+  let trimmed_end = text.trim_end().len();
+  for (idx, ch) in text.char_indices() {
+    let is_word_char =
+      ch.is_alphanumeric() || matches!(ch, '\'' | '’' | '-' | '.');
+    if is_word_char {
+      if word_start.is_none() {
+        word_start = Some(idx);
+        word_is_capital = ch.is_uppercase();
+      }
+      continue;
+    }
+    let Some(start) = word_start.take() else {
+      continue;
+    };
+    let word = text.get(start..idx);
+    let is_capital = word_is_capital || is_elided_capital(word);
+    // A capitalized token that opens a new sentence ("... de Paris. La
+    // décision ...") must stop the scan, not extend the name. It qualifies
+    // only when the previous token ended in a sentence-final period and this
+    // token is a starter/connector that has no business inside the name.
+    if is_capital && starts_new_sentence(prev_word, word, sentence_starters) {
+      break;
+    }
+    if is_capital {
+      last_capital_end = Some(idx);
+      prev_word = word;
+      continue;
+    }
+    if armed && is_sentence_starter(word, sentence_starters) {
+      break;
+    }
+    if !is_in_name_connector(word)
+      && !is_sentence_starter(word, sentence_starters)
+    {
+      armed = true;
+    }
+    prev_word = word;
+  }
+  if let Some(start) = word_start {
+    let tail = text.get(start..trimmed_end);
+    if (word_is_capital || is_elided_capital(tail))
+      && !starts_new_sentence(prev_word, tail, sentence_starters)
+    {
+      last_capital_end = Some(trimmed_end);
+    }
+  }
+  let end = last_capital_end?;
+  (end < trimmed_end).then_some(end)
+}
+
+/// French/Italian elisions hide the capital behind an apostrophe:
+/// "d'Aix-en-Provence", "l'Oreal", "dell'Arte". A token whose 1-4 letter
+/// lowercase prefix is followed by an apostrophe and an uppercase letter is
+/// part of a proper name, not clause prose.
+fn is_elided_capital(word: Option<&str>) -> bool {
+  let Some(word) = word else {
+    return false;
+  };
+  let Some(apostrophe) = word.find(['\'', '\u{2019}']) else {
+    return false;
+  };
+  let Some(prefix) = word.get(..apostrophe) else {
+    return false;
+  };
+  if prefix.is_empty()
+    || prefix.chars().count() > 4
+    || !prefix
+      .chars()
+      .all(|ch| ch.is_alphabetic() && ch.is_lowercase())
+  {
+    return false;
+  }
+  word
+    .get(apostrophe..)
+    .and_then(|tail| tail.chars().nth(1))
+    .is_some_and(char::is_uppercase)
+}
+
+fn is_in_name_connector(word: Option<&str>) -> bool {
+  word.is_some_and(|word| {
+    IN_NAME_CONNECTORS.contains(&word.to_lowercase().as_str())
+  })
+}
+
+fn is_sentence_starter(
+  word: Option<&str>,
+  sentence_starters: Option<&BTreeSet<String>>,
+) -> bool {
+  let (Some(word), Some(starters)) = (word, sentence_starters) else {
+    return false;
+  };
+  starters.contains(&word.to_lowercase())
+}
+
+/// A capitalized `word` begins a new sentence (so it must not be recorded as
+/// part of the organization name) when the previous token closed a sentence
+/// and this token is a sentence-starter or an in-name connector used at
+/// sentence position (French "La", "Le", ...). A capitalized connector after a
+/// sentence-final period is a sentence start, not an in-name particle.
+fn starts_new_sentence(
+  prev_word: Option<&str>,
+  word: Option<&str>,
+  sentence_starters: Option<&BTreeSet<String>>,
+) -> bool {
+  ends_with_sentence_final_period(prev_word)
+    && (is_sentence_starter(word, sentence_starters)
+      || is_in_name_connector(word))
+}
+
+/// The token closes a sentence: it ends in a period whose stem is a
+/// multi-character word carrying a lowercase letter ("Paris."). This excludes
+/// dotted initialisms and acronyms ("J.P.", "U.S.") whose stem has no
+/// lowercase letter, so a capitalized token still joins the name across them.
+fn ends_with_sentence_final_period(word: Option<&str>) -> bool {
+  let Some(word) = word else {
+    return false;
+  };
+  let stem = word.trim_end_matches('.');
+  stem.len() != word.len()
+    && stem.chars().take(2).count() == 2
+    && stem.chars().any(char::is_lowercase)
+}
+
 fn word_count(text: &str) -> usize {
   let mut count = 0usize;
   let mut in_word = false;
@@ -860,6 +1143,268 @@ mod tests {
   use std::collections::BTreeSet;
 
   use super::*;
+
+  #[test]
+  fn trims_trailing_prose_back_to_last_capital() {
+    // Trailing prose is all lowercase, so the last-capital scan lands on the
+    // name's final proper-noun token even without a sentence-starter boundary.
+    assert_eq!(
+      trim_open_ended_org_prose(
+        "Conseil de prud'hommes des Sables-d'Olonne a rendu son jugement",
+        None
+      ),
+      Some("Conseil de prud'hommes des Sables-d'Olonne".len())
+    );
+    assert_eq!(
+      trim_open_ended_org_prose(
+        "Tribunal judiciaire du Mans statue sur l'affaire",
+        None
+      ),
+      Some("Tribunal judiciaire du Mans".len())
+    );
+  }
+
+  #[test]
+  fn stops_at_sentence_starter_before_trailing_defined_term() {
+    // Trailing clause prose contains a capitalized defined term ("Services").
+    // Without a boundary the last-capital scan would keep it; the lowercase
+    // sentence-starter "the" marks the end of the org name so the trim lands on
+    // "Corporation".
+    let starters = set(["the", "this", "for", "by"]);
+    assert_eq!(
+      trim_open_ended_org_prose(
+        "ACME Corporation shall provide the Services under this agreement",
+        Some(&starters)
+      ),
+      Some("ACME Corporation".len())
+    );
+  }
+
+  #[test]
+  fn keeps_in_name_article_before_prose() {
+    // "the" here is an in-name article inside "Bank of the West National
+    // Association", not the start of trailing clause prose. The scan must not
+    // stop on it (it arrives before any prose token arms the starter-stop), so
+    // the trim lands at/after "Association".
+    let starters = set(["the", "this", "for", "by", "a"]);
+    assert_eq!(
+      trim_open_ended_org_prose(
+        "Bank of the West National Association shall provide services",
+        Some(&starters)
+      ),
+      Some("Bank of the West National Association".len())
+    );
+  }
+
+  #[test]
+  fn arms_starter_stop_only_after_prose_token() {
+    // Symmetric to the in-name article case: once a prose token ("shall") has
+    // been seen, a following sentence-starter ("the") does stop the scan so the
+    // capitalized defined term ("Services") stays out of the name.
+    let starters = set(["the", "this", "for", "by", "a"]);
+    assert_eq!(
+      trim_open_ended_org_prose(
+        "ACME Corporation shall provide the Services under this agreement",
+        Some(&starters)
+      ),
+      Some("ACME Corporation".len())
+    );
+  }
+
+  #[test]
+  fn elided_city_name_is_kept_when_trimming_org_prose() {
+    let starters = set(["the", "this", "for", "by", "a"]);
+    let text = "Conseil de prud'hommes d'Aix-en-Provence a rendu son jugement";
+    let keep = "Conseil de prud'hommes d'Aix-en-Provence";
+    assert_eq!(
+      trim_open_ended_org_prose(text, Some(&starters)),
+      Some(keep.len()),
+      "the elided d'Aix-en-Provence token must count as capitalized"
+    );
+  }
+
+  #[test]
+  fn in_name_connector_does_not_arm_before_city() {
+    // French court name: the "de"/"des" connectors do not arm the starter-stop,
+    // so the hyphenated city is recorded before any English-style starter
+    // ("a") could stop the scan. Trim ends at "Sables-d'Olonne".
+    let starters = set(["the", "this", "for", "by", "a"]);
+    assert_eq!(
+      trim_open_ended_org_prose(
+        "Tribunal de commerce des Sables-d'Olonne a rendu son jugement",
+        Some(&starters)
+      ),
+      Some("Tribunal de commerce des Sables-d'Olonne".len())
+    );
+  }
+
+  #[test]
+  fn stops_at_capitalized_sentence_starter_after_period() {
+    // "Tribunal de commerce de Paris. La décision ..." — the sentence-final
+    // period after "Paris" ends the court name. "La" is a capitalized French
+    // sentence starter (also an in-name connector when lowercased), so left
+    // unchecked it is recorded as a name token and the retained span keeps
+    // ". La" garbage. The post-period stop cuts the scan at the period so the
+    // name ends at "Paris." (the caller does not strip the trailing dot).
+    assert_eq!(
+      trim_open_ended_org_prose(
+        "Tribunal de commerce de Paris. La décision a été rendue aujourd'hui",
+        None
+      ),
+      Some("Tribunal de commerce de Paris.".len())
+    );
+  }
+
+  #[test]
+  fn dotted_initials_join_across_capital_after_period() {
+    // "J.P." is a dotted initialism, not a sentence end: its stem carries no
+    // lowercase letter, so the following capitalized token joins the name and
+    // only the trailing lowercase clause is trimmed.
+    let starters = set(["the", "this", "for", "by", "a"]);
+    assert_eq!(
+      trim_open_ended_org_prose(
+        "J.P. Morgan Chase Bank agreed to the terms",
+        Some(&starters)
+      ),
+      Some("J.P. Morgan Chase Bank".len())
+    );
+  }
+
+  #[test]
+  fn open_ended_org_stops_before_capitalized_sentence_starter() {
+    // Entity-level: the open-ended trigger org exceeds the word guard, is
+    // trimmed to "...Paris.", and the following French sentence ("La décision
+    // ...") is dropped rather than absorbed. Uses default filters (empty
+    // sentence starters) to prove the in-name-connector path ("la") arms the
+    // stop without any per-language starter data.
+    let text =
+      "Tribunal de commerce de Paris. La décision a été rendue aujourd'hui.";
+    let entities = filter_entity_false_positives(
+      vec![entity(
+        text,
+        text,
+        ORGANIZATION_LABEL,
+        DetectionSource::Trigger,
+      )],
+      text,
+      Some(&DenyListFilterData::default()),
+    )
+    .unwrap();
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].text, "Tribunal de commerce de Paris.");
+  }
+
+  #[test]
+  fn keeps_capital_terminated_names_untrimmed() {
+    // Nothing to trim when the name already ends at a capital token.
+    assert_eq!(
+      trim_open_ended_org_prose(
+        "Conseil de prud'hommes des Sables-d'Olonne",
+        None
+      ),
+      None
+    );
+    assert_eq!(trim_open_ended_org_prose("Bank of America", None), None);
+  }
+
+  #[test]
+  fn open_ended_court_org_survives_word_guard_by_trimming() {
+    // Nine words with trailing prose: rejected outright before the trim,
+    // now trimmed to the five-word proper-noun core and kept.
+    let text =
+      "Conseil de prud'hommes des Sables-d'Olonne a rendu son jugement.";
+    let entities = filter_entity_false_positives(
+      vec![entity(
+        text,
+        text,
+        ORGANIZATION_LABEL,
+        DetectionSource::Trigger,
+      )],
+      text,
+      Some(&DenyListFilterData::default()),
+    )
+    .unwrap();
+    assert_eq!(entities.len(), 1);
+    assert_eq!(
+      entities[0].text,
+      "Conseil de prud'hommes des Sables-d'Olonne"
+    );
+  }
+
+  #[test]
+  fn keeps_unit_continuation_after_street_abbreviation() {
+    // "123 Main St. Suite 100": the period is the street abbreviation's own
+    // dot, not a sentence end, so the unit continuation must not be trimmed.
+    let filters = DenyListFilterData {
+      street_types: set(["st.", "street"]),
+      ..DenyListFilterData::default()
+    };
+    assert_eq!(
+      trim_trailing_address_prose("123 Main St. Suite 100", &filters),
+      None
+    );
+    // A full street name behaves the same (already did).
+    assert_eq!(
+      trim_trailing_address_prose("123 Main Street. Suite 100", &filters),
+      None
+    );
+  }
+
+  #[test]
+  fn keeps_lettered_suite_continuation_after_abbreviation() {
+    let filters = DenyListFilterData {
+      street_types: set(["st.", "street"]),
+      ..DenyListFilterData::default()
+    };
+    assert_eq!(
+      trim_trailing_address_prose("123 Main St. Suite A", &filters),
+      None,
+      "a lettered unit after a designator is an address continuation"
+    );
+    assert_eq!(
+      trim_trailing_address_prose("123 Main St. Suite The tenant", &filters),
+      Some("123 Main St.".len()),
+      "prose after a designator must still trim"
+    );
+  }
+
+  #[test]
+  fn keeps_unit_designator_but_trims_capitalized_heading_after_abbreviation() {
+    // Only real unit designators ("Suite", "Apt") count as a continuation of
+    // the address. A capitalized heading that merely precedes a number
+    // ("Section 2 applies") is trailing prose and must be trimmed off.
+    let filters = DenyListFilterData {
+      street_types: set(["st.", "street"]),
+      ..DenyListFilterData::default()
+    };
+    assert_eq!(
+      trim_trailing_address_prose("123 Main St. Apt 4B", &filters),
+      None
+    );
+    assert_eq!(
+      trim_trailing_address_prose("123 Main St. Section 2 applies", &filters),
+      Some("123 Main St.".len())
+    );
+  }
+
+  #[test]
+  fn trims_new_sentence_after_street_abbreviation() {
+    // "123 Main St. The tenant shall pay rent": the period is the street
+    // abbreviation's dot, but what follows is a new prose sentence, not a
+    // unit continuation, so the sentence trim must apply while keeping the
+    // abbreviation dot on "St.".
+    let filters = DenyListFilterData {
+      street_types: set(["st.", "street"]),
+      ..DenyListFilterData::default()
+    };
+    assert_eq!(
+      trim_trailing_address_prose(
+        "123 Main St. The tenant shall pay rent",
+        &filters
+      ),
+      Some("123 Main St.".len())
+    );
+  }
 
   #[test]
   fn rejects_template_placeholders() {

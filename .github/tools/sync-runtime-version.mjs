@@ -6,8 +6,21 @@ const VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta|alpha)\.[0-9]+)?$/;
 
 const PACKAGE_FILES = [
   "packages/anonymize/package.json",
+  "packages/anonymize-darwin-arm64/package.json",
+  "packages/anonymize-darwin-x64/package.json",
+  "packages/anonymize-linux-arm64-gnu/package.json",
+  "packages/anonymize-linux-x64-gnu/package.json",
+  "packages/anonymize-win32-x64-msvc/package.json",
   "packages/anonymize/wasm/package.json",
   "packages/cli/package.json",
+];
+const ROOT_RUNTIME_PACKAGE_FILE = "packages/anonymize/package.json";
+const ROOT_NATIVE_OPTIONAL_DEPENDENCIES = [
+  "@stll/anonymize-darwin-arm64",
+  "@stll/anonymize-darwin-x64",
+  "@stll/anonymize-linux-arm64-gnu",
+  "@stll/anonymize-linux-x64-gnu",
+  "@stll/anonymize-win32-x64-msvc",
 ];
 
 const CARGO_WORKSPACE_MANIFEST = "Cargo.toml";
@@ -39,8 +52,13 @@ const SYNCED_DEPENDENCY_RANGE_RE = /("@stll\/anonymize": "\^)([^"]+)(")/g;
 
 const escapeRegExp = (value) => value.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+// Windows runners check out with CRLF line endings; the version regexes below
+// anchor on "\n", so normalize before matching (files are written back LF-only).
+const readTextFile = (file) =>
+  readFileSync(file, "utf8").replaceAll("\r\n", "\n");
+
 const syncTextVersion = ({ file, label, re }) => {
-  const text = readFileSync(file, "utf8");
+  const text = readTextFile(file);
   const match = text.match(re);
   if (!match) {
     console.error(`${file} has no ${label} version entry`);
@@ -93,14 +111,45 @@ for (const file of PACKAGE_FILES) {
   console.log(`Updated ${file} to ${version}`);
 }
 
+{
+  const pkg = JSON.parse(readFileSync(ROOT_RUNTIME_PACKAGE_FILE, "utf8"));
+  const wantedVersion = version;
+  let changed = false;
+  for (const dependency of ROOT_NATIVE_OPTIONAL_DEPENDENCIES) {
+    const current = pkg.optionalDependencies?.[dependency];
+    if (current === wantedVersion) {
+      continue;
+    }
+    if (checkOnly) {
+      console.error(
+        `${ROOT_RUNTIME_PACKAGE_FILE} optional dependency ${dependency}@${current}; expected ${wantedVersion}`,
+      );
+      hasMismatch = true;
+      continue;
+    }
+    pkg.optionalDependencies ??= {};
+    pkg.optionalDependencies[dependency] = wantedVersion;
+    changed = true;
+  }
+  if (changed) {
+    writeFileSync(
+      ROOT_RUNTIME_PACKAGE_FILE,
+      `${JSON.stringify(pkg, null, 2)}\n`,
+    );
+    console.log(
+      `Updated ${ROOT_RUNTIME_PACKAGE_FILE} native optional dependency versions to ${wantedVersion}`,
+    );
+  }
+}
+
 syncTextVersion({
   file: CARGO_WORKSPACE_MANIFEST,
   label: "Cargo workspace",
-  re: /(\[workspace\.package\][\s\S]*?\r?\nversion\s*=\s*")([^"]+)(")/,
+  re: /(\[workspace\.package\][\s\S]*?\nversion\s*=\s*")([^"]+)(")/,
 });
 
 for (const file of PYPROJECT_FILES) {
-  const text = readFileSync(file, "utf8");
+  const text = readTextFile(file);
   const explicitVersion = text.match(/^version\s*=\s*"([^"]+)"/m);
   if (explicitVersion) {
     syncTextVersion({
@@ -121,7 +170,7 @@ for (const file of PYPROJECT_FILES) {
   hasMismatch = true;
 }
 
-const lockText = readFileSync(LOCK_FILE, "utf8");
+const lockText = readTextFile(LOCK_FILE);
 let lockChanged = false;
 let syncedLockText = lockText.replaceAll(
   SYNCED_DEPENDENCY_RANGE_RE,
@@ -141,10 +190,20 @@ let syncedLockText = lockText.replaceAll(
   },
 );
 
+for (const dependency of ROOT_NATIVE_OPTIONAL_DEPENDENCIES) {
+  const syncedSidecar = syncNativeOptionalDependencyLockVersion(
+    syncedLockText,
+    dependency,
+  );
+  syncedLockText = syncedSidecar.text;
+  lockChanged ||= syncedSidecar.changed;
+  hasMismatch ||= syncedSidecar.hasMismatch;
+}
+
 for (const file of PACKAGE_FILES) {
   const workspace = dirname(file);
   const workspaceVersionRe = new RegExp(
-    `("${escapeRegExp(workspace)}": \\{\\r?\\n\\s+"name": "[^"]+",\\r?\\n\\s+"version": ")([^"]+)(")`,
+    `("${escapeRegExp(workspace)}": \\{\\n\\s+"name": "[^"]+",\\n\\s+"version": ")([^"]+)(")`,
   );
   const match = syncedLockText.match(workspaceVersionRe);
   if (!match) {
@@ -176,13 +235,13 @@ if (lockChanged) {
   );
 }
 
-const cargoLockText = readFileSync(CARGO_LOCK_FILE, "utf8");
+const cargoLockText = readTextFile(CARGO_LOCK_FILE);
 let cargoLockChanged = false;
 let syncedCargoLockText = cargoLockText;
 
 for (const packageName of CARGO_LOCKED_PACKAGES) {
   const packageVersionRe = new RegExp(
-    `(\\[\\[package\\]\\]\\r?\\nname = "${escapeRegExp(packageName)}"\\r?\\nversion = ")([^"]+)(")`,
+    `(\\[\\[package\\]\\]\\nname = "${escapeRegExp(packageName)}"\\nversion = ")([^"]+)(")`,
   );
   const match = syncedCargoLockText.match(packageVersionRe);
   if (!match) {
@@ -217,4 +276,41 @@ if (cargoLockChanged) {
 
 if (hasMismatch) {
   process.exit(1);
+}
+
+function syncNativeOptionalDependencyLockVersion(text, dependency) {
+  const sidecarVersionRe = new RegExp(
+    `("${escapeRegExp(dependency)}": ")([^"]+)(")`,
+    "g",
+  );
+  let found = false;
+  let changed = false;
+  let mismatched = false;
+  const syncedText = text.replaceAll(
+    sidecarVersionRe,
+    (match, prefix, lockedVersion, suffix) => {
+      found = true;
+      if (lockedVersion === version) {
+        return match;
+      }
+      if (checkOnly) {
+        console.error(
+          `${LOCK_FILE} has ${dependency}@${lockedVersion}; expected ${version}`,
+        );
+        mismatched = true;
+        return match;
+      }
+      changed = true;
+      return `${prefix}${version}${suffix}`;
+    },
+  );
+  if (!found) {
+    console.error(`${LOCK_FILE} has no optional dependency ${dependency}`);
+    mismatched = true;
+  }
+  return {
+    text: syncedText,
+    changed,
+    hasMismatch: mismatched,
+  };
 }

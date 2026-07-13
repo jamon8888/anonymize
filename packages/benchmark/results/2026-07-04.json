@@ -1,0 +1,569 @@
+{
+  "createdAt": "2026-07-04T06:43:03.842Z",
+  "gitSha": "45f20e9",
+  "hardware": "darwin/arm64, 8x Apple M3, 24 GiB RAM",
+  "runtime": "Bun 1.3.14",
+  "corpus": {
+    "documents": 28,
+    "entities": 196,
+    "byLanguage": {
+      "cs": 10,
+      "de": 8,
+      "en": 10
+    },
+    "byLabel": {
+      "date": 29,
+      "person": 40,
+      "address": 24,
+      "organization": 31,
+      "id-number": 19,
+      "money": 21,
+      "email": 19,
+      "phone": 13
+    }
+  },
+  "matching": {
+    "primary": "overlap: same label and IoU >= 0.5",
+    "secondary": "exact: same label and identical [start, end)"
+  },
+  "libraries": [
+    {
+      "name": "stella",
+      "version": "2.0.0",
+      "status": "ok",
+      "supportedLabels": [
+        "address",
+        "date",
+        "email",
+        "id-number",
+        "money",
+        "organization",
+        "person",
+        "phone"
+      ],
+      "throughput": {
+        "initSeconds": 1.2764847910000001,
+        "totalChars": 8153,
+        "coldCharsPerSec": 290541.27950844506,
+        "warmCharsPerSec": 907102.4912329882
+      },
+      "overall": {
+        "overlapAll": {
+          "precision": 0.9096385542168675,
+          "recall": 0.7704081632653061,
+          "f1": 0.8342541436464089,
+          "tp": 151,
+          "fp": 15,
+          "fn": 45
+        },
+        "overlapSupported": {
+          "precision": 0.9096385542168675,
+          "recall": 0.7704081632653061,
+          "f1": 0.8342541436464089,
+          "tp": 151,
+          "fp": 15,
+          "fn": 45
+        },
+        "exactAll": {
+          "precision": 0.7831325301204819,
+          "recall": 0.6632653061224489,
+          "f1": 0.718232044198895,
+          "tp": 130,
+          "fp": 36,
+          "fn": 66
+        }
+      },
+      "perLabel": {
+        "person": {
+          "precision": 0.972972972972973,
+          "recall": 0.9,
+          "f1": 0.935064935064935,
+          "tp": 36,
+          "fp": 1,
+          "fn": 4
+        },
+        "organization": {
+          "precision": 0.65,
+          "recall": 0.41935483870967744,
+          "f1": 0.5098039215686274,
+          "tp": 13,
+          "fp": 7,
+          "fn": 18
+        },
+        "address": {
+          "precision": 0.8,
+          "recall": 0.8333333333333334,
+          "f1": 0.816326530612245,
+          "tp": 20,
+          "fp": 5,
+          "fn": 4
+        },
+        "email": {
+          "precision": 1,
+          "recall": 0.9473684210526315,
+          "f1": 0.972972972972973,
+          "tp": 18,
+          "fp": 0,
+          "fn": 1
+        },
+        "phone": {
+          "precision": 0.8571428571428571,
+          "recall": 0.46153846153846156,
+          "f1": 0.6,
+          "tp": 6,
+          "fp": 1,
+          "fn": 7
+        },
+        "id-number": {
+          "precision": 0.9166666666666666,
+          "recall": 0.5789473684210527,
+          "f1": 0.7096774193548387,
+          "tp": 11,
+          "fp": 1,
+          "fn": 8
+        },
+        "date": {
+          "precision": 1,
+          "recall": 0.9655172413793104,
+          "f1": 0.9824561403508771,
+          "tp": 28,
+          "fp": 0,
+          "fn": 1
+        },
+        "money": {
+          "precision": 1,
+          "recall": 0.9047619047619048,
+          "f1": 0.9500000000000001,
+          "tp": 19,
+          "fp": 0,
+          "fn": 2
+        }
+      },
+      "perLanguage": {
+        "cs": {
+          "precision": 0.8596491228070176,
+          "recall": 0.7,
+          "f1": 0.7716535433070866,
+          "tp": 49,
+          "fp": 8,
+          "fn": 21
+        },
+        "de": {
+          "precision": 0.8888888888888888,
+          "recall": 0.7547169811320755,
+          "f1": 0.8163265306122449,
+          "tp": 40,
+          "fp": 5,
+          "fn": 13
+        },
+        "en": {
+          "precision": 0.96875,
+          "recall": 0.8493150684931506,
+          "f1": 0.9051094890510949,
+          "tp": 62,
+          "fp": 2,
+          "fn": 11
+        }
+      }
+    },
+    {
+      "name": "presidio",
+      "version": "2.2.360",
+      "status": "ok",
+      "supportedLabels": [
+        "address",
+        "date",
+        "email",
+        "id-number",
+        "organization",
+        "person",
+        "phone"
+      ],
+      "throughput": {
+        "initSeconds": 2.145188250011415,
+        "totalChars": 8153,
+        "coldCharsPerSec": 23826.188350629665,
+        "warmCharsPerSec": 41243.81491423083
+      },
+      "overall": {
+        "overlapAll": {
+          "precision": 0.5303867403314917,
+          "recall": 0.4897959183673469,
+          "f1": 0.5092838196286471,
+          "tp": 96,
+          "fp": 85,
+          "fn": 100
+        },
+        "overlapSupported": {
+          "precision": 0.5303867403314917,
+          "recall": 0.5485714285714286,
+          "f1": 0.5393258426966293,
+          "tp": 96,
+          "fp": 85,
+          "fn": 79
+        },
+        "exactAll": {
+          "precision": 0.5027624309392266,
+          "recall": 0.4642857142857143,
+          "f1": 0.48275862068965525,
+          "tp": 91,
+          "fp": 90,
+          "fn": 105
+        }
+      },
+      "perLabel": {
+        "person": {
+          "precision": 0.7547169811320755,
+          "recall": 1,
+          "f1": 0.8602150537634409,
+          "tp": 40,
+          "fp": 13,
+          "fn": 0
+        },
+        "organization": {
+          "precision": 0.5454545454545454,
+          "recall": 0.5806451612903226,
+          "f1": 0.5625,
+          "tp": 18,
+          "fp": 15,
+          "fn": 13
+        },
+        "address": {
+          "precision": 0,
+          "recall": 0,
+          "f1": 0,
+          "tp": 0,
+          "fp": 38,
+          "fn": 24
+        },
+        "email": {
+          "precision": 1,
+          "recall": 0.5263157894736842,
+          "f1": 0.6896551724137931,
+          "tp": 10,
+          "fp": 0,
+          "fn": 9
+        },
+        "phone": {
+          "precision": 0.6111111111111112,
+          "recall": 0.8461538461538461,
+          "f1": 0.7096774193548387,
+          "tp": 11,
+          "fp": 7,
+          "fn": 2
+        },
+        "id-number": {
+          "precision": 0.6363636363636364,
+          "recall": 0.3684210526315789,
+          "f1": 0.4666666666666667,
+          "tp": 7,
+          "fp": 4,
+          "fn": 12
+        },
+        "date": {
+          "precision": 0.5555555555555556,
+          "recall": 0.3448275862068966,
+          "f1": 0.4255319148936171,
+          "tp": 10,
+          "fp": 8,
+          "fn": 19
+        },
+        "money": {
+          "precision": 0,
+          "recall": 0,
+          "f1": 0,
+          "tp": 0,
+          "fp": 0,
+          "fn": 21
+        }
+      },
+      "perLanguage": {
+        "cs": {
+          "precision": 0.42,
+          "recall": 0.3,
+          "f1": 0.35000000000000003,
+          "tp": 21,
+          "fp": 29,
+          "fn": 49
+        },
+        "de": {
+          "precision": 0.6190476190476191,
+          "recall": 0.49056603773584906,
+          "f1": 0.5473684210526316,
+          "tp": 26,
+          "fp": 16,
+          "fn": 27
+        },
+        "en": {
+          "precision": 0.550561797752809,
+          "recall": 0.6712328767123288,
+          "f1": 0.6049382716049383,
+          "tp": 49,
+          "fp": 40,
+          "fn": 24
+        }
+      }
+    },
+    {
+      "name": "scrubadub",
+      "version": "2.0.1",
+      "status": "ok",
+      "notes": "active detectors: credential, credit_card, email, phone, social_security_number, twitter, url",
+      "supportedLabels": ["email", "id-number", "phone"],
+      "throughput": {
+        "initSeconds": 0.00018937500135507435,
+        "totalChars": 8153,
+        "coldCharsPerSec": 506995.8337721068,
+        "warmCharsPerSec": 1563699.6138713364
+      },
+      "overall": {
+        "overlapAll": {
+          "precision": 0.9090909090909091,
+          "recall": 0.15306122448979592,
+          "f1": 0.2620087336244542,
+          "tp": 30,
+          "fp": 3,
+          "fn": 166
+        },
+        "overlapSupported": {
+          "precision": 0.9090909090909091,
+          "recall": 0.5882352941176471,
+          "f1": 0.7142857142857143,
+          "tp": 30,
+          "fp": 3,
+          "fn": 21
+        },
+        "exactAll": {
+          "precision": 0.9090909090909091,
+          "recall": 0.15306122448979592,
+          "f1": 0.2620087336244542,
+          "tp": 30,
+          "fp": 3,
+          "fn": 166
+        }
+      },
+      "perLabel": {
+        "person": {
+          "precision": 0,
+          "recall": 0,
+          "f1": 0,
+          "tp": 0,
+          "fp": 0,
+          "fn": 40
+        },
+        "organization": {
+          "precision": 0,
+          "recall": 0,
+          "f1": 0,
+          "tp": 0,
+          "fp": 0,
+          "fn": 31
+        },
+        "address": {
+          "precision": 0,
+          "recall": 0,
+          "f1": 0,
+          "tp": 0,
+          "fp": 0,
+          "fn": 24
+        },
+        "email": {
+          "precision": 0.95,
+          "recall": 1,
+          "f1": 0.9743589743589743,
+          "tp": 19,
+          "fp": 1,
+          "fn": 0
+        },
+        "phone": {
+          "precision": 0.8461538461538461,
+          "recall": 0.8461538461538461,
+          "f1": 0.8461538461538461,
+          "tp": 11,
+          "fp": 2,
+          "fn": 2
+        },
+        "id-number": {
+          "precision": 0,
+          "recall": 0,
+          "f1": 0,
+          "tp": 0,
+          "fp": 0,
+          "fn": 19
+        },
+        "date": {
+          "precision": 0,
+          "recall": 0,
+          "f1": 0,
+          "tp": 0,
+          "fp": 0,
+          "fn": 29
+        },
+        "money": {
+          "precision": 0,
+          "recall": 0,
+          "f1": 0,
+          "tp": 0,
+          "fp": 0,
+          "fn": 21
+        }
+      },
+      "perLanguage": {
+        "cs": {
+          "precision": 0.8888888888888888,
+          "recall": 0.11428571428571428,
+          "f1": 0.20253164556962022,
+          "tp": 8,
+          "fp": 1,
+          "fn": 62
+        },
+        "de": {
+          "precision": 1,
+          "recall": 0.18867924528301888,
+          "f1": 0.3174603174603175,
+          "tp": 10,
+          "fp": 0,
+          "fn": 43
+        },
+        "en": {
+          "precision": 0.8571428571428571,
+          "recall": 0.1643835616438356,
+          "f1": 0.2758620689655173,
+          "tp": 12,
+          "fp": 2,
+          "fn": 61
+        }
+      }
+    },
+    {
+      "name": "redact-pii",
+      "version": "3.4.0",
+      "status": "ok",
+      "supportedLabels": ["address", "email", "id-number", "person", "phone"],
+      "throughput": {
+        "initSeconds": 0.010813833000000158,
+        "totalChars": 8153,
+        "coldCharsPerSec": 3911.3690865234507,
+        "warmCharsPerSec": 55823.49150160447
+      },
+      "overall": {
+        "overlapAll": {
+          "precision": 0.381294964028777,
+          "recall": 0.27040816326530615,
+          "f1": 0.3164179104477612,
+          "tp": 53,
+          "fp": 86,
+          "fn": 143
+        },
+        "overlapSupported": {
+          "precision": 0.381294964028777,
+          "recall": 0.4608695652173913,
+          "f1": 0.41732283464566927,
+          "tp": 53,
+          "fp": 86,
+          "fn": 62
+        },
+        "exactAll": {
+          "precision": 0.26618705035971224,
+          "recall": 0.18877551020408162,
+          "f1": 0.2208955223880597,
+          "tp": 37,
+          "fp": 102,
+          "fn": 159
+        }
+      },
+      "perLabel": {
+        "person": {
+          "precision": 0.43243243243243246,
+          "recall": 0.4,
+          "f1": 0.4155844155844156,
+          "tp": 16,
+          "fp": 21,
+          "fn": 24
+        },
+        "organization": {
+          "precision": 0,
+          "recall": 0,
+          "f1": 0,
+          "tp": 0,
+          "fp": 0,
+          "fn": 31
+        },
+        "address": {
+          "precision": 0.04,
+          "recall": 0.041666666666666664,
+          "f1": 0.04081632653061224,
+          "tp": 1,
+          "fp": 24,
+          "fn": 23
+        },
+        "email": {
+          "precision": 0.9473684210526315,
+          "recall": 0.9473684210526315,
+          "f1": 0.9473684210526315,
+          "tp": 18,
+          "fp": 1,
+          "fn": 1
+        },
+        "phone": {
+          "precision": 0.6363636363636364,
+          "recall": 0.5384615384615384,
+          "f1": 0.5833333333333334,
+          "tp": 7,
+          "fp": 4,
+          "fn": 6
+        },
+        "id-number": {
+          "precision": 0.23404255319148937,
+          "recall": 0.5789473684210527,
+          "f1": 0.3333333333333333,
+          "tp": 11,
+          "fp": 36,
+          "fn": 8
+        },
+        "date": {
+          "precision": 0,
+          "recall": 0,
+          "f1": 0,
+          "tp": 0,
+          "fp": 0,
+          "fn": 29
+        },
+        "money": {
+          "precision": 0,
+          "recall": 0,
+          "f1": 0,
+          "tp": 0,
+          "fp": 0,
+          "fn": 21
+        }
+      },
+      "perLanguage": {
+        "cs": {
+          "precision": 0.37142857142857144,
+          "recall": 0.18571428571428572,
+          "f1": 0.24761904761904763,
+          "tp": 13,
+          "fp": 22,
+          "fn": 57
+        },
+        "de": {
+          "precision": 0.41025641025641024,
+          "recall": 0.3018867924528302,
+          "f1": 0.34782608695652173,
+          "tp": 16,
+          "fp": 23,
+          "fn": 37
+        },
+        "en": {
+          "precision": 0.36923076923076925,
+          "recall": 0.3287671232876712,
+          "f1": 0.34782608695652173,
+          "tp": 24,
+          "fp": 41,
+          "fn": 49
+        }
+      }
+    }
+  ]
+}

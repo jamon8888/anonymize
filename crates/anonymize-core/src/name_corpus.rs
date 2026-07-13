@@ -1,12 +1,11 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, ops::Range, time::Instant};
 
 use crate::resolution::{DetectionSource, PipelineEntity};
 use crate::types::{Error, Result};
 
+mod cjk;
+
 const PERSON_LABEL: &str = "person";
-const CJK_HAN_RATIO_NUMERATOR: usize = 15;
-const CJK_HAN_RATIO_DENOMINATOR: usize = 100;
-const CJK_SCORE: f64 = 0.95;
 const HIGH_CONFIDENCE_NAME_SCORE: f64 = 0.9;
 const TITLE_NAME_SCORE: f64 = 0.95;
 const LOW_CONFIDENCE_NAME_SCORE: f64 = 0.5;
@@ -15,11 +14,14 @@ const ALL_CAPS_NAME_LINE_RATIO: f64 = 0.9;
 const ALL_CAPS_NAME_LINE_MIN_LETTERS: usize = 3;
 const ALL_CAPS_NAME_LINE_MAX_TOKENS: usize = 6;
 const MAX_HORIZONTAL_CHAIN_GAP: usize = 4;
+const SUPPLEMENTAL_SEED_WINDOW_RADIUS: usize = MAX_CHAIN + 2;
 
 #[derive(
   Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize,
 )]
 pub struct NameCorpusData {
+  #[serde(default)]
+  pub mode: NameCorpusMode,
   #[serde(default)]
   pub first_names: Vec<String>,
   #[serde(default)]
@@ -54,6 +56,7 @@ pub struct NameCorpusData {
 
 #[derive(Clone, Debug)]
 pub struct PreparedNameCorpusData {
+  mode: NameCorpusMode,
   first_names: HashSet<String>,
   surnames: HashSet<String>,
   title_tokens: HashSet<String>,
@@ -65,10 +68,58 @@ pub struct PreparedNameCorpusData {
   ja_suffixes: HashSet<String>,
   arabic_connectors: HashSet<String>,
   relation_connectors: HashSet<String>,
+  relation_connector_prefixes: HashSet<String>,
   hyphenated_prefixes: HashSet<String>,
   cjk_non_person_terms: HashSet<String>,
   cjk_surname_starters: HashSet<char>,
   organization_terms: HashSet<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NameCorpusDetectionProfile {
+  pub(crate) cjk_count: usize,
+  pub(crate) cjk_elapsed_us: u64,
+  pub(crate) word_count: usize,
+  pub(crate) segment_elapsed_us: u64,
+  pub(crate) supplemental_seed_count: usize,
+  pub(crate) supplemental_seed_elapsed_us: u64,
+  pub(crate) token_count: usize,
+  pub(crate) classify_elapsed_us: u64,
+  pub(crate) token_entity_count: usize,
+  pub(crate) chain_elapsed_us: u64,
+  pub(crate) dedupe_count: usize,
+  pub(crate) dedupe_elapsed_us: u64,
+  pub(crate) filter_count: usize,
+  pub(crate) filter_elapsed_us: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct NameCorpusDetection {
+  pub(crate) entities: Vec<PipelineEntity>,
+  pub(crate) profile: NameCorpusDetectionProfile,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TokenNameDetection {
+  entities: Vec<PipelineEntity>,
+  profile: NameCorpusDetectionProfile,
+}
+
+#[derive(
+  Clone,
+  Copy,
+  Debug,
+  Default,
+  Eq,
+  PartialEq,
+  serde::Deserialize,
+  serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum NameCorpusMode {
+  Full,
+  #[default]
+  Supplemental,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,7 +154,12 @@ struct ClassifiedToken<'a> {
 impl PreparedNameCorpusData {
   #[must_use]
   pub fn new(data: NameCorpusData) -> Self {
+    let relation_connectors = lower_string_set(data.relation_connectors);
+    let relation_connector_prefixes =
+      relation_connector_prefixes(&relation_connectors);
+
     Self {
+      mode: data.mode,
       first_names: string_set(data.first_names),
       surnames: string_set(data.surnames),
       title_tokens: lower_string_set(data.title_tokens),
@@ -114,7 +170,8 @@ impl PreparedNameCorpusData {
       excluded_all_caps: string_set(data.excluded_all_caps),
       ja_suffixes: lower_string_set(data.ja_suffixes),
       arabic_connectors: lower_string_set(data.arabic_connectors),
-      relation_connectors: lower_string_set(data.relation_connectors),
+      relation_connectors,
+      relation_connector_prefixes,
       hyphenated_prefixes: lower_string_set(data.hyphenated_prefixes),
       cjk_non_person_terms: string_set(data.cjk_non_person_terms),
       cjk_surname_starters: data
@@ -131,110 +188,127 @@ impl PreparedNameCorpusData {
     full_text: &str,
     deny_list_entities: &[PipelineEntity],
   ) -> Result<Vec<PipelineEntity>> {
-    let mut entities = self.detect_cjk_names(full_text)?;
-    entities.extend(self.detect_token_names(full_text)?);
-    let mut entities = deduplicate_spans(entities);
-    entities.retain(|entity| {
-      !deny_list_entities
-        .iter()
-        .any(|deny| covers_same_label(entity, deny))
-    });
-    Ok(entities)
+    self.detect(full_text, NameCorpusMode::Supplemental, deny_list_entities)
   }
 
-  fn detect_cjk_names(&self, full_text: &str) -> Result<Vec<PipelineEntity>> {
-    if self.cjk_surname_starters.is_empty() {
-      return Ok(Vec::new());
-    }
-
-    let text_len = full_text.chars().count();
-    let threshold =
-      ceil_ratio(text_len, CJK_HAN_RATIO_NUMERATOR, CJK_HAN_RATIO_DENOMINATOR);
-    let threshold = threshold.max(1);
-    let mut han_count = 0usize;
-    for ch in full_text.chars() {
-      if is_han(ch) {
-        han_count = han_count.saturating_add(1);
-        if han_count >= threshold {
-          break;
-        }
-      }
-    }
-    if text_len >= 100 && han_count >= threshold {
-      return Ok(Vec::new());
-    }
-
-    let mut entities = Vec::new();
-    let mut run_start = None;
-    let mut run_chars = 0usize;
-    let mut previous_end = 0usize;
-    for (index, ch) in full_text.char_indices() {
-      if is_han(ch) {
-        if run_start.is_none() {
-          run_start = Some(index);
-        }
-        run_chars = run_chars.saturating_add(1);
-        previous_end = index.saturating_add(ch.len_utf8());
-        continue;
-      }
-      self.push_cjk_run(
-        full_text,
-        run_start,
-        previous_end,
-        run_chars,
-        &mut entities,
-      )?;
-      run_start = None;
-      run_chars = 0;
-    }
-    self.push_cjk_run(
-      full_text,
-      run_start,
-      full_text.len(),
-      run_chars,
-      &mut entities,
-    )?;
-    Ok(entities)
-  }
-
-  fn push_cjk_run(
+  pub fn detect_configured(
     &self,
     full_text: &str,
-    start: Option<usize>,
-    end: usize,
-    char_count: usize,
-    entities: &mut Vec<PipelineEntity>,
-  ) -> Result<()> {
-    if !(2..=4).contains(&char_count) {
-      return Ok(());
-    }
-    let Some(start) = start else {
-      return Ok(());
-    };
-    let Some(text) = full_text.get(start..end) else {
-      return Err(invalid_name_data("cjk span is not a UTF-8 boundary"));
-    };
-    if !self.is_likely_cjk_person_name(text) || self.is_organization(text) {
-      return Ok(());
-    }
-    entities.push(PipelineEntity::detected(
-      usize_to_u32(start, "name_corpus.cjk.start")?,
-      usize_to_u32(end, "name_corpus.cjk.end")?,
-      PERSON_LABEL,
-      text,
-      CJK_SCORE,
-      DetectionSource::Regex,
-    ));
-    Ok(())
+    deny_list_entities: &[PipelineEntity],
+  ) -> Result<Vec<PipelineEntity>> {
+    self.detect(full_text, self.mode, deny_list_entities)
   }
 
-  fn detect_token_names(&self, full_text: &str) -> Result<Vec<PipelineEntity>> {
+  pub(crate) fn detect_configured_profiled(
+    &self,
+    full_text: &str,
+    deny_list_entities: &[PipelineEntity],
+  ) -> Result<NameCorpusDetection> {
+    self.detect_profiled(full_text, self.mode, deny_list_entities)
+  }
+
+  pub fn detect(
+    &self,
+    full_text: &str,
+    mode: NameCorpusMode,
+    deny_list_entities: &[PipelineEntity],
+  ) -> Result<Vec<PipelineEntity>> {
+    self
+      .detect_profiled(full_text, mode, deny_list_entities)
+      .map(|detection| detection.entities)
+  }
+
+  fn detect_profiled(
+    &self,
+    full_text: &str,
+    mode: NameCorpusMode,
+    deny_list_entities: &[PipelineEntity],
+  ) -> Result<NameCorpusDetection> {
+    let mut profile = NameCorpusDetectionProfile::default();
+    let cjk_start = Instant::now();
+    let mut entities = cjk::detect(self, full_text)?;
+    profile.cjk_elapsed_us = elapsed_us(cjk_start);
+    profile.cjk_count = entities.len();
+
+    let token_detection = self.detect_token_names_profiled(full_text, mode)?;
+    merge_name_profile(&mut profile, &token_detection.profile);
+    entities.extend(token_detection.entities);
+
+    let dedupe_start = Instant::now();
+    let mut entities = deduplicate_spans(entities);
+    profile.dedupe_elapsed_us = elapsed_us(dedupe_start);
+    profile.dedupe_count = entities.len();
+
+    if mode == NameCorpusMode::Supplemental {
+      let filter_start = Instant::now();
+      entities.retain(|entity| {
+        !deny_list_entities
+          .iter()
+          .any(|deny| covers_same_label(entity, deny))
+      });
+      profile.filter_elapsed_us = elapsed_us(filter_start);
+      profile.filter_count = entities.len();
+    }
+
+    Ok(NameCorpusDetection { entities, profile })
+  }
+
+  fn detect_token_names_profiled(
+    &self,
+    full_text: &str,
+    mode: NameCorpusMode,
+  ) -> Result<TokenNameDetection> {
+    let mut profile = NameCorpusDetectionProfile::default();
+    let segment_start = Instant::now();
     let words = segment_words(full_text);
+    profile.segment_elapsed_us = elapsed_us(segment_start);
+    profile.word_count = words.len();
+
+    let seed_start = Instant::now();
+    let seed_indexes = if mode == NameCorpusMode::Supplemental {
+      self.supplemental_seed_indexes(&words)
+    } else {
+      Vec::new()
+    };
+    profile.supplemental_seed_elapsed_us = elapsed_us(seed_start);
+    profile.supplemental_seed_count = seed_indexes.len();
+    if mode == NameCorpusMode::Supplemental && seed_indexes.is_empty() {
+      return Ok(TokenNameDetection {
+        entities: Vec::new(),
+        profile,
+      });
+    }
+
+    let classify_start = Instant::now();
+    let token_windows = if mode == NameCorpusMode::Supplemental {
+      self.classify_supplemental_windows(full_text, &words, &seed_indexes)
+    } else {
+      vec![self.classify_tokens(full_text, &words)]
+    };
+    profile.classify_elapsed_us = elapsed_us(classify_start);
+    profile.token_count = token_windows.iter().map(Vec::len).sum();
+
+    let chain_start = Instant::now();
+    let mut entities = Vec::new();
+    for tokens in &token_windows {
+      entities.extend(self.detect_token_chains(full_text, mode, tokens)?);
+    }
+    profile.chain_elapsed_us = elapsed_us(chain_start);
+    profile.token_entity_count = entities.len();
+
+    Ok(TokenNameDetection { entities, profile })
+  }
+
+  fn classify_tokens<'a>(
+    &self,
+    full_text: &'a str,
+    words: &[WordSegment<'a>],
+  ) -> Vec<ClassifiedToken<'a>> {
     let mut tokens = Vec::with_capacity(words.len());
     let mut word_index = 0usize;
     while let Some(word) = words.get(word_index) {
       if let Some((connector, end, consumed)) =
-        relation_connector(word, &words, word_index, full_text, self)
+        relation_connector(word, words, word_index, full_text, self)
       {
         tokens.push(ClassifiedToken {
           text: connector,
@@ -250,6 +324,34 @@ impl PreparedNameCorpusData {
       tokens.push(self.classify_token(word, full_text));
       word_index = word_index.saturating_add(1);
     }
+    tokens
+  }
+
+  fn classify_supplemental_windows<'a>(
+    &self,
+    full_text: &'a str,
+    words: &[WordSegment<'a>],
+    seed_indexes: &[usize],
+  ) -> Vec<Vec<ClassifiedToken<'a>>> {
+    supplemental_seed_windows(seed_indexes, words.len())
+      .into_iter()
+      .filter_map(|window| {
+        words
+          .get(window)
+          .map(|window_words| self.classify_tokens(full_text, window_words))
+      })
+      .collect()
+  }
+
+  fn detect_token_chains(
+    &self,
+    full_text: &str,
+    mode: NameCorpusMode,
+    tokens: &[ClassifiedToken<'_>],
+  ) -> Result<Vec<PipelineEntity>> {
+    if tokens.is_empty() {
+      return Ok(Vec::new());
+    }
 
     let mut consumed = vec![false; tokens.len()];
     let mut entities = Vec::new();
@@ -264,9 +366,8 @@ impl PreparedNameCorpusData {
         continue;
       }
 
-      let chain = Self::build_chain(full_text, &tokens, index);
-      let Some(score) = supplemental_chain_score(full_text, &chain, self)
-      else {
+      let chain = Self::build_chain(full_text, tokens, index);
+      let Some(score) = chain_score(full_text, &chain, self, mode) else {
         continue;
       };
       let Some(first) = chain.first() else {
@@ -391,6 +492,31 @@ impl PreparedNameCorpusData {
     classified(word, TokenKind::Capitalized, false)
   }
 
+  fn supplemental_seed_indexes(&self, words: &[WordSegment<'_>]) -> Vec<usize> {
+    words
+      .iter()
+      .enumerate()
+      .filter_map(|(index, word)| {
+        self.is_supplemental_seed(word.text).then_some(index)
+      })
+      .collect()
+  }
+
+  fn is_supplemental_seed(&self, text: &str) -> bool {
+    if self.is_non_western_name_token(text)
+      || self.is_hyphenated_prefix_name(text)
+    {
+      return true;
+    }
+    if text.chars().count() < 3 || !is_all_upper(text) {
+      return false;
+    }
+    if self.excluded_all_caps.contains(text) {
+      return false;
+    }
+    self.is_non_western_name_token(&title_case_simple(text))
+  }
+
   fn build_chain<'a>(
     full_text: &str,
     tokens: &'a [ClassifiedToken<'a>],
@@ -444,7 +570,7 @@ impl PreparedNameCorpusData {
     chain
   }
 
-  fn is_likely_cjk_person_name(&self, text: &str) -> bool {
+  pub(super) fn is_likely_cjk_person_name(&self, text: &str) -> bool {
     if self.cjk_non_person_terms.contains(text) {
       return false;
     }
@@ -454,9 +580,8 @@ impl PreparedNameCorpusData {
       .is_some_and(|first| self.cjk_surname_starters.contains(&first))
   }
 
-  fn is_organization(&self, text: &str) -> bool {
-    let words = segment_words(text);
-    words
+  pub(super) fn is_organization(&self, text: &str) -> bool {
+    segment_words(text)
       .iter()
       .any(|word| self.organization_terms.contains(&word.text.to_lowercase()))
   }
@@ -514,19 +639,33 @@ impl PreparedNameCorpusData {
   }
 }
 
-fn supplemental_chain_score(
+const fn merge_name_profile(
+  target: &mut NameCorpusDetectionProfile,
+  source: &NameCorpusDetectionProfile,
+) {
+  target.word_count = source.word_count;
+  target.segment_elapsed_us = source.segment_elapsed_us;
+  target.supplemental_seed_count = source.supplemental_seed_count;
+  target.supplemental_seed_elapsed_us = source.supplemental_seed_elapsed_us;
+  target.token_count = source.token_count;
+  target.classify_elapsed_us = source.classify_elapsed_us;
+  target.token_entity_count = source.token_entity_count;
+  target.chain_elapsed_us = source.chain_elapsed_us;
+}
+
+fn chain_score(
   full_text: &str,
   chain: &[&ClassifiedToken<'_>],
   data: &PreparedNameCorpusData,
+  mode: NameCorpusMode,
 ) -> Option<f64> {
   let has_title = chain.iter().any(|token| token.kind == TokenKind::Title);
+  let has_corpus_name = chain.iter().any(|token| is_corpus_match(token.kind));
+  let has_first_name = chain.iter().any(|token| token.kind == TokenKind::Name);
   let has_abbreviation = chain
     .iter()
     .any(|token| token.kind == TokenKind::Abbreviation);
   let has_non_western = chain.iter().any(|token| token.non_western);
-  if !has_non_western {
-    return None;
-  }
   let has_ja_suffix =
     chain.iter().any(|token| token.kind == TokenKind::JaSuffix);
   let has_arabic_connector = chain
@@ -536,33 +675,90 @@ fn supplemental_chain_score(
     .iter()
     .filter(|token| token.kind == TokenKind::Capitalized)
     .count();
+  let corpus_count = chain
+    .iter()
+    .filter(|token| is_corpus_match(token.kind))
+    .count();
   let non_western_count =
     chain.iter().filter(|token| token.non_western).count();
   let chain_all_common_words = chain
     .iter()
     .all(|token| data.common_words.contains(&token.text.to_lowercase()));
-  let title_confidence =
-    has_title && (non_western_count > 0 || capitalized_count > 0);
-  let high_confidence = (has_ja_suffix
-    && (capitalized_count > 0 || non_western_count > 0))
-    || (has_arabic_connector && non_western_count > 0)
-    || non_western_count >= 2
-    || (non_western_count > 0
-      && (capitalized_count > 0 || has_abbreviation)
-      && !chain_all_common_words);
-  let score = if title_confidence {
-    TITLE_NAME_SCORE
-  } else if high_confidence {
-    HIGH_CONFIDENCE_NAME_SCORE
-  } else if non_western_count == 1
-    && chain.len() == 1
-    && !is_sentence_start(full_text, chain.first()?.start)
-  {
-    LOW_CONFIDENCE_NAME_SCORE
-  } else {
+  if has_non_western {
+    let title_confidence =
+      has_title && (non_western_count > 0 || capitalized_count > 0);
+    let high_confidence = (has_ja_suffix
+      && (capitalized_count > 0 || non_western_count > 0))
+      || (has_arabic_connector && non_western_count > 0)
+      || non_western_count >= 2
+      || (non_western_count > 0
+        && (capitalized_count > 0 || has_abbreviation)
+        && !chain_all_common_words);
+    let score = if title_confidence {
+      TITLE_NAME_SCORE
+    } else if high_confidence {
+      HIGH_CONFIDENCE_NAME_SCORE
+    } else if non_western_count == 1
+      && chain.len() == 1
+      && !is_sentence_start(full_text, chain.first()?.start)
+    {
+      LOW_CONFIDENCE_NAME_SCORE
+    } else {
+      return None;
+    };
+    if mode == NameCorpusMode::Supplemental
+      && score < HIGH_CONFIDENCE_NAME_SCORE
+    {
+      return None;
+    }
+    return Some(score);
+  }
+
+  if mode == NameCorpusMode::Supplemental {
     return None;
-  };
-  (score >= LOW_CONFIDENCE_NAME_SCORE).then_some(score)
+  }
+
+  if has_title && has_corpus_name {
+    return Some(TITLE_NAME_SCORE);
+  }
+  if corpus_count >= 2 {
+    return Some(HIGH_CONFIDENCE_NAME_SCORE);
+  }
+  if has_corpus_name && capitalized_count > 0 {
+    return Some(0.7);
+  }
+  if has_abbreviation && has_corpus_name {
+    return Some(0.7);
+  }
+  if has_first_name && chain.len() == 1 {
+    let first = chain.first()?;
+    if is_sentence_start(full_text, first.start)
+      || (is_all_upper(first.text) && first.text.chars().count() >= 3)
+    {
+      return None;
+    }
+    return Some(LOW_CONFIDENCE_NAME_SCORE);
+  }
+  if !has_first_name
+    && chain.len() == 1
+    && chain.first()?.kind == TokenKind::Surname
+  {
+    return None;
+  }
+  if has_title && chain.len() == 1 {
+    return None;
+  }
+  if has_ja_suffix || has_arabic_connector {
+    if !has_corpus_name && !has_first_name {
+      return None;
+    }
+    return Some(LOW_CONFIDENCE_NAME_SCORE);
+  }
+  has_corpus_name.then_some(LOW_CONFIDENCE_NAME_SCORE)
+}
+
+const fn is_corpus_match(kind: TokenKind) -> bool {
+  matches!(kind, TokenKind::Name | TokenKind::Surname)
 }
 
 fn segment_words(full_text: &str) -> Vec<WordSegment<'_>> {
@@ -599,6 +795,30 @@ fn segment_words(full_text: &str) -> Vec<WordSegment<'_>> {
   words
 }
 
+fn supplemental_seed_windows(
+  seed_indexes: &[usize],
+  word_count: usize,
+) -> Vec<Range<usize>> {
+  let mut windows: Vec<Range<usize>> = Vec::new();
+  for seed_index in seed_indexes {
+    let start = seed_index.saturating_sub(SUPPLEMENTAL_SEED_WINDOW_RADIUS);
+    let end = seed_index
+      .saturating_add(SUPPLEMENTAL_SEED_WINDOW_RADIUS)
+      .saturating_add(1)
+      .min(word_count);
+    let Some(previous) = windows.last_mut() else {
+      windows.push(start..end);
+      continue;
+    };
+    if start <= previous.end {
+      previous.end = previous.end.max(end);
+      continue;
+    }
+    windows.push(start..end);
+  }
+  windows
+}
+
 fn relation_connector<'a>(
   word: &WordSegment<'a>,
   words: &[WordSegment<'a>],
@@ -607,7 +827,7 @@ fn relation_connector<'a>(
   data: &PreparedNameCorpusData,
 ) -> Option<(&'a str, usize, usize)> {
   let lower = word.text.to_lowercase();
-  if !matches!(lower.as_str(), "s" | "d" | "w" | "r") {
+  if !data.relation_connector_prefixes.contains(&lower) {
     return None;
   }
   let next = words.get(index.saturating_add(1))?;
@@ -814,14 +1034,6 @@ fn is_all_caps_context_line(full_text: &str, start: usize) -> bool {
   upper / letters >= ALL_CAPS_NAME_LINE_RATIO
 }
 
-const fn ceil_ratio(
-  value: usize,
-  numerator: usize,
-  denominator: usize,
-) -> usize {
-  value.saturating_mul(numerator).div_ceil(denominator)
-}
-
 fn is_all_caps_line_name_shaped(full_text: &str, start: usize) -> bool {
   let line = current_line(full_text, start);
   if line.chars().any(|ch| ch.is_ascii_digit()) {
@@ -863,21 +1075,6 @@ fn is_word_char(ch: char) -> bool {
   ch.is_alphanumeric() || ch == '\''
 }
 
-const fn is_han(ch: char) -> bool {
-  matches!(
-    ch,
-    '\u{3400}'..='\u{4DBF}'
-      | '\u{4E00}'..='\u{9FFF}'
-      | '\u{F900}'..='\u{FAFF}'
-      | '\u{20000}'..='\u{2A6DF}'
-      | '\u{2A700}'..='\u{2B73F}'
-      | '\u{2B740}'..='\u{2B81F}'
-      | '\u{2B820}'..='\u{2CEAF}'
-      | '\u{2CEB0}'..='\u{2EBEF}'
-      | '\u{30000}'..='\u{3134F}'
-  )
-}
-
 fn string_set(values: Vec<String>) -> HashSet<String> {
   values.into_iter().collect()
 }
@@ -889,11 +1086,27 @@ fn lower_string_set(values: Vec<String>) -> HashSet<String> {
     .collect()
 }
 
+fn relation_connector_prefixes(
+  relation_connectors: &HashSet<String>,
+) -> HashSet<String> {
+  relation_connectors
+    .iter()
+    .filter_map(|connector| connector.split_once('/').map(|(prefix, _)| prefix))
+    .filter(|prefix| !prefix.is_empty())
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
 fn usize_to_u32(value: usize, field: &'static str) -> Result<u32> {
   u32::try_from(value).map_err(|_| Error::InvalidStaticData {
     field,
     reason: String::from("offset exceeds u32 range"),
   })
+}
+
+fn elapsed_us(start: Instant) -> u64 {
+  let micros = start.elapsed().as_micros();
+  u64::try_from(micros).unwrap_or(u64::MAX)
 }
 
 fn invalid_name_data(reason: &'static str) -> Error {
@@ -909,6 +1122,40 @@ mod tests {
   use super::*;
 
   #[test]
+  fn full_mode_detects_western_corpus_chain() {
+    let data = PreparedNameCorpusData::new(NameCorpusData {
+      first_names: vec![String::from("Mina")],
+      surnames: vec![String::from("Roe")],
+      ..NameCorpusData::default()
+    });
+
+    let entities = data
+      .detect("Agreement signed by Mina Roe.", NameCorpusMode::Full, &[])
+      .expect("full name-corpus detection should succeed");
+
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].text, "Mina Roe");
+    assert!(
+      (entities[0].score - HIGH_CONFIDENCE_NAME_SCORE).abs() < f64::EPSILON
+    );
+  }
+
+  #[test]
+  fn supplemental_mode_rejects_western_only_chain() {
+    let data = PreparedNameCorpusData::new(NameCorpusData {
+      first_names: vec![String::from("Mina")],
+      surnames: vec![String::from("Roe")],
+      ..NameCorpusData::default()
+    });
+
+    let entities = data
+      .detect_supplemental("Agreement signed by Mina Roe.", &[])
+      .expect("supplemental name-corpus detection should succeed");
+
+    assert!(entities.is_empty());
+  }
+
+  #[test]
   fn supplemental_detects_cjk_name_with_configured_surname() {
     let data = PreparedNameCorpusData::new(NameCorpusData {
       cjk_surname_starters: vec![String::from("王")],
@@ -921,7 +1168,7 @@ mod tests {
 
     assert_eq!(entities.len(), 1);
     assert_eq!(entities[0].text, "王小明");
-    assert!((entities[0].score - CJK_SCORE).abs() < f64::EPSILON);
+    assert!((entities[0].score - cjk::SCORE).abs() < f64::EPSILON);
   }
 
   #[test]
@@ -970,6 +1217,47 @@ mod tests {
     assert!(
       (entities[0].score - HIGH_CONFIDENCE_NAME_SCORE).abs() < f64::EPSILON
     );
+  }
+
+  #[test]
+  fn supplemental_seed_does_not_enable_distant_western_chain() {
+    let data = PreparedNameCorpusData::new(NameCorpusData {
+      first_names: vec![String::from("Mina")],
+      surnames: vec![String::from("Roe")],
+      non_western_names: vec![String::from("Sato")],
+      ..NameCorpusData::default()
+    });
+    let filler = " ordinary".repeat(SUPPLEMENTAL_SEED_WINDOW_RADIUS + 3);
+    let text = format!("Sato{filler}. Agreement signed by Mina Roe.");
+
+    let entities = data
+      .detect_supplemental(&text, &[])
+      .expect("supplemental name-corpus detection should succeed");
+
+    assert!(
+      entities.iter().all(|entity| entity.text != "Mina Roe"),
+      "detected entities: {entities:?}",
+    );
+  }
+
+  #[test]
+  fn relation_connector_prefixes_come_from_data() {
+    let data = PreparedNameCorpusData::new(NameCorpusData {
+      non_western_names: vec![
+        String::from("Rahul"),
+        String::from("Kumar"),
+        String::from("Vikram"),
+      ],
+      relation_connectors: vec![String::from("x/o")],
+      ..NameCorpusData::default()
+    });
+
+    let entities = data
+      .detect_supplemental("Rahul Kumar x/o Vikram Kumar signed.", &[])
+      .expect("name detection should succeed");
+
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0].text, "Rahul Kumar x/o Vikram Kumar");
   }
 
   #[test]

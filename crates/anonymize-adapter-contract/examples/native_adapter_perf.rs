@@ -1,8 +1,8 @@
 #![allow(clippy::print_stdout)]
 
-use std::env;
 use std::io::Write;
 use std::time::Instant;
+use std::{env, fs};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -10,7 +10,7 @@ use stella_anonymize_adapter_contract::{
   BindingOperatorConfig, BindingPreparedSearchConfig,
   operator_config_from_binding, prepared_search_config_from_binding,
 };
-use stella_anonymize_core::PreparedSearch;
+use stella_anonymize_core::PreparedEngine;
 
 #[derive(Deserialize)]
 struct Payload {
@@ -26,14 +26,17 @@ struct Case {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-  let payload = env::var("STELLA_ANONYMIZE_PERF_PAYLOAD")?;
+  let payload = match env::var("STELLA_ANONYMIZE_PERF_PAYLOAD_PATH") {
+    Ok(path) => fs::read_to_string(path)?,
+    Err(_) => env::var("STELLA_ANONYMIZE_PERF_PAYLOAD")?,
+  };
   let payload = serde_json::from_str::<Payload>(&payload)?;
   let config =
     serde_json::from_str::<BindingPreparedSearchConfig>(&payload.config_json)?;
 
   let prepare_start = Instant::now();
   let prepared =
-    PreparedSearch::new(prepared_search_config_from_binding(config)?)?;
+    PreparedEngine::new(prepared_search_config_from_binding(config)?)?;
   let prepare_ms = elapsed_ms(prepare_start);
 
   let run_cases = payload

@@ -4,7 +4,6 @@ import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
-  createPipelineContext,
   DEFAULT_NATIVE_PIPELINE_CONFIG,
   prepareNativePipelinePackage,
 } from "../dist/index.mjs";
@@ -12,14 +11,13 @@ import { loadNativeAnonymizeBinding } from "../dist/native-node.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 const outputPath = resolve(args.out ?? "native-pipeline.stlanonpkg");
-const compressed = args.raw !== true;
+const compressed = args.compressed === true;
 const { config, gazetteerEntries } = await loadPackageInput(args);
 const binding = loadNativeAnonymizeBinding();
 const packageBytes = await prepareNativePipelinePackage({
   binding,
   config,
   gazetteerEntries,
-  context: createPipelineContext(),
   compressed,
 });
 
@@ -60,8 +58,22 @@ function parseArgs(values) {
         result.raw = true;
         break;
       }
+      case "--compressed": {
+        result.compressed = true;
+        break;
+      }
       case "--default-dictionaries": {
         result.defaultDictionaries = true;
+        break;
+      }
+      case "--language": {
+        result.language = requiredValue(values, index, value);
+        index += 1;
+        break;
+      }
+      case "--languages": {
+        result.languages = requiredValue(values, index, value);
+        index += 1;
         break;
       }
       case "--help": {
@@ -71,6 +83,9 @@ function parseArgs(values) {
       default:
         throw new Error(`Unknown option: ${value}`);
     }
+  }
+  if (result.raw && result.compressed) {
+    throw new Error("Use either --raw or --compressed, not both");
   }
   return result;
 }
@@ -85,15 +100,19 @@ function requiredValue(values, index, option) {
 
 async function loadPackageInput(options) {
   const input = await loadBasePackageInput(options);
-  if (!options.defaultDictionaries || input.config.dictionaries !== undefined) {
-    return input;
-  }
+  const withDictionaries =
+    !options.defaultDictionaries || input.config.dictionaries !== undefined
+      ? input
+      : {
+          ...input,
+          config: {
+            ...input.config,
+            dictionaries: await loadDefaultDictionaries(),
+          },
+        };
   return {
-    ...input,
-    config: {
-      ...input.config,
-      dictionaries: await loadDefaultDictionaries(),
-    },
+    ...withDictionaries,
+    config: applyCliLanguageScope(withDictionaries.config, options),
   };
 }
 
@@ -132,6 +151,40 @@ function defaultNativePipelineConfig() {
   };
 }
 
+function applyCliLanguageScope(pipelineConfig, options) {
+  if (options.language !== undefined && options.languages !== undefined) {
+    throw new Error("Use either --language or --languages, not both");
+  }
+  if (options.language !== undefined) {
+    const language = normalizeLanguageOption(options.language, "--language");
+    return { ...pipelineConfig, language, languages: undefined };
+  }
+  if (options.languages === undefined) {
+    return pipelineConfig;
+  }
+  const languages = normalizeLanguageList(options.languages);
+  return { ...pipelineConfig, language: undefined, languages };
+}
+
+function normalizeLanguageOption(value, option) {
+  const language = value.trim().toLowerCase();
+  if (language.length === 0) {
+    throw new Error(`${option} requires a non-empty language code`);
+  }
+  return language;
+}
+
+function normalizeLanguageList(value) {
+  const languages = value
+    .split(",")
+    .map((entry) => normalizeLanguageOption(entry, "--languages"))
+    .filter((entry, index, entries) => entries.indexOf(entry) === index);
+  if (languages.length === 0) {
+    throw new Error("--languages requires at least one language code");
+  }
+  return languages;
+}
+
 async function loadDefaultDictionaries() {
   let loaded;
   try {
@@ -163,7 +216,10 @@ Options:
   --out <path>              Output package path. Defaults to native-pipeline.stlanonpkg.
   --config <path>           ESM module exporting a PipelineConfig or { config, gazetteerEntries }.
   --export <name>           Export name to read from the config module. Defaults to default.
+  --language <code>         Build a package scoped to one content language.
+  --languages <codes>       Build a package scoped to comma-separated content languages.
   --default-dictionaries    Load @stll/anonymize-data into configs that do not provide dictionaries.
-  --raw                     Write an uncompressed package.
+  --compressed              Write an LZ4-compressed package.
+  --raw                     Write an uncompressed package. This is the default.
 `);
 }

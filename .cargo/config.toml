@@ -2,11 +2,8 @@
 [registries.crates-io]
 protocol = "sparse"
 
-# Build artifacts: set CARGO_TARGET_DIR env var to customize location
-# Defaults to local target/ if not set (works on all platforms)
-# Example: export CARGO_TARGET_DIR=E:/cargo-target/anonymize
-
 [alias]
 ci-fmt = "fmt --all -- --check"
 ci-clippy = "clippy --workspace --all-targets --all-features --locked -- -D warnings"
+ci-dylint = "dylint --workspace --all"
 ci-test = "test --workspace --all-features --locked"

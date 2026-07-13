@@ -2,13 +2,19 @@
 name = "stella-anonymize-napi"
 version.workspace = true
 edition.workspace = true
-description = "Native bindings for Stella anonymization core"
+description = "Native bindings for stella anonymization core"
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
+
+[features]
+default = ["zstd"]
+# Forwards to the adapter contract's zstd read support. Disabled for wasm
+# builds via `--no-default-features`.
+zstd = ["stella-anonymize-adapter-contract/zstd"]
 
 [dependencies]
 blake3 = "1"
@@ -18,7 +24,7 @@ napi = { version = "3", default-features = false, features = [
 ] }
 napi-derive = "3"
 serde_json = "1"
-stella-anonymize-adapter-contract = { path = "../anonymize-adapter-contract" }
+stella-anonymize-adapter-contract = { path = "../anonymize-adapter-contract", default-features = false }
 stella-anonymize-core = { path = "../anonymize-core" }
 
 [build-dependencies]

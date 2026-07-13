@@ -5,6 +5,10 @@
   clippy::unwrap_used
 )]
 
+#[path = "support/snapshots.rs"]
+mod snapshots;
+
+use snapshots::redaction_snapshot;
 use stella_anonymize_core::{
   Entity, Error, OperatorConfig, OperatorType, deanonymise, redact_text,
 };
@@ -72,6 +76,10 @@ fn repeated_values_share_first_non_colliding_placeholder() {
     deanonymise(&result.redacted_text, &result.redaction_map),
     text
   );
+  insta::assert_yaml_snapshot!(
+    "placeholder_collision_redaction",
+    redaction_snapshot(&result)
+  );
 }
 
 #[test]
@@ -102,30 +110,39 @@ fn normalized_identifier_values_share_placeholder() {
 }
 
 #[test]
-fn contextual_identifier_cues_share_identifier_placeholder() {
+fn generic_identifier_cues_keep_distinct_placeholder_keys() {
   let text = concat!(
     "CNI: 12AB34567 was present. ",
     "CNI nº 12AB34567 was repeated. ",
-    "CNI 12AB34567 was listed."
+    "CNI 12AB34567 was listed. ",
+    "12AB34567 was bare."
+  );
+  let bare_start = byte_len(
+    text
+      .get(..text.rfind("12AB34567").unwrap_or(0))
+      .unwrap_or(""),
   );
   let entities = vec![
     entity(text, "national identification number", "CNI: 12AB34567"),
     entity(text, "national identification number", "CNI nº 12AB34567"),
     entity(text, "national identification number", "CNI 12AB34567"),
+    Entity::detected(
+      bare_start,
+      bare_start.saturating_add(byte_len("12AB34567")),
+      "national identification number",
+      "12AB34567",
+    ),
   ];
 
   let result =
     redact_text(text, &entities, &OperatorConfig::default()).unwrap();
 
-  assert_eq!(result.redaction_map.len(), 1);
-  assert_eq!(
-    result.redaction_map[0].placeholder,
-    "[NATIONAL_IDENTIFICATION_NUMBER_1]"
-  );
+  assert_eq!(result.redaction_map.len(), 4);
+  assert_eq!(result.redacted_text.matches('[').count(), 4);
 }
 
 #[test]
-fn identifier_normalization_stops_before_trailing_prose() {
+fn generic_identifier_normalization_keeps_trailing_prose_in_key() {
   let text = "Reg AB12345 expires. Reg AB12345 repeats.";
   let second_start = text
     .rfind("AB12345")
@@ -153,11 +170,7 @@ fn identifier_normalization_stops_before_trailing_prose() {
   let result =
     redact_text(text, &entities, &OperatorConfig::default()).unwrap();
 
-  assert_eq!(result.redaction_map.len(), 1);
-  assert_eq!(
-    result.redaction_map[0].placeholder,
-    "[REGISTRATION_NUMBER_1]"
-  );
+  assert_eq!(result.redaction_map.len(), 2);
 }
 
 #[test]
@@ -210,6 +223,10 @@ fn coreference_alias_uses_source_placeholder_and_value() {
     "[ORGANIZATION_1] signed. [ORGANIZATION_1] countersigned."
   );
   assert_eq!(result.redaction_map[0].original, "Acme Corporation");
+  insta::assert_yaml_snapshot!(
+    "coreference_alias_redaction",
+    redaction_snapshot(&result)
+  );
 }
 
 #[test]

@@ -6,10 +6,16 @@ mod address_context;
 mod address_seeds;
 mod anchored;
 mod artifact_bytes;
+/// Stage-1 native-config assembly inputs and embedded canonical data.
+pub mod assemble;
 pub(crate) mod byte_offsets;
 mod coreference;
 mod dates;
 mod diagnostics;
+/// Cross-crate concurrency seam: scoped OS threads on native, sequential
+/// execution on WebAssembly. Public for reuse by workspace binding crates.
+#[doc(hidden)]
+pub mod exec;
 mod false_positives;
 mod hotwords;
 mod legal_forms;
@@ -33,8 +39,8 @@ pub use address_seeds::AddressSeedData;
 pub use coreference::{CoreferenceData, CoreferencePatternData};
 pub use dates::DateData;
 pub use diagnostics::{
-  DiagnosticEvent, DiagnosticEventKind, DiagnosticStage,
-  StaticRedactionDiagnostics,
+  DiagnosticDetail, DiagnosticEvent, DiagnosticEventKind, DiagnosticPhase,
+  DiagnosticScope, DiagnosticStage, StaticRedactionDiagnostics,
 };
 pub use hotwords::{HotwordRule, HotwordRuleData};
 pub use legal_forms::LegalFormData;
@@ -42,20 +48,22 @@ pub use money::{
   AmountWordsData, CurrencyData, MagnitudeSuffixData, MonetaryData,
   ShareQuantityTermData, WrittenAmountPatternData,
 };
-pub use name_corpus::{NameCorpusData, PreparedNameCorpusData};
+pub use name_corpus::{NameCorpusData, NameCorpusMode, PreparedNameCorpusData};
 pub use normalize::normalize_for_search;
 pub use placeholders::build_placeholder_map;
 pub use prepared::{
-  PreparedSearch, PreparedSearchArtifacts, PreparedSearchBuildResult,
-  PreparedSearchConfig, PreparedSearchMatches, PreparedSearchSlices,
-  StaticDetectionResult, StaticRedactionDiagnosticResult,
-  StaticRedactionResult,
+  PreparedEngine, PreparedEngineArtifacts, PreparedEngineArtifactsView,
+  PreparedEngineBuildResult, PreparedEngineConfig,
+  PreparedEngineDetectorConfig, PreparedEngineMatches,
+  PreparedEnginePolicyConfig, PreparedEngineSearchConfig, PreparedEngineSlices,
+  StaticDetectionResult, StaticEntityLayers, StaticRedactionDiagnosticResult,
+  StaticRedactionResult, StaticRedactionStreamEvent,
 };
 pub use processors::{
-  CountryMatchData, DenyListFilterData, DenyListMatchData, GazetteerMatchData,
-  PatternSlice, RegexMatchMeta, SigningPlaceGuardData, StringGroups,
-  process_country_matches, process_deny_list_matches,
-  process_gazetteer_matches, process_regex_matches,
+  CountryMatchData, DenyListFilterData, DenyListMatchData, DenyListPatternMeta,
+  DenyListPatternMetaSet, GazetteerMatchData, PatternSlice, RegexMatchMeta,
+  SigningPlaceGuardData, StringGroups, process_country_matches,
+  process_deny_list_matches, process_gazetteer_matches, process_regex_matches,
 };
 pub use redact::{deanonymise, redact_text};
 pub use resolution::{
@@ -63,9 +71,11 @@ pub use resolution::{
   merge_and_dedup, sanitize_entities,
 };
 pub use search::{
-  FuzzySearchOptions, LiteralSearchOptions, RegexSearchOptions, SearchIndex,
-  SearchIndexArtifacts, SearchOptions, SearchPattern,
+  FuzzySearchOptions, LiteralSearchOptions, PreparedArtifactPolicy,
+  RegexArtifactPolicy, RegexSearchOptions, SearchIndex, SearchIndexArtifacts,
+  SearchOptions, SearchPattern,
 };
+pub use signatures::SignatureData;
 pub use triggers::{
   TriggerData, TriggerRule, TriggerStrategy, TriggerValidation,
 };

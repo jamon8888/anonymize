@@ -62,6 +62,19 @@ export type CorefAliasEntity = EntityBase & {
 export type Entity = DetectedEntity | CorefAliasEntity;
 
 /**
+ * Pluggable NER inference callback. Implementations receive the full source
+ * text plus the resolved label set and threshold, and return detected entity
+ * spans. GLiNER2 is wired through this type via
+ * `buildGliner2Inference` (`@stll/anonymize/gliner2`).
+ */
+export type NerInferenceFn = (
+  fullText: string,
+  labels: readonly string[],
+  threshold: number,
+  signal?: AbortSignal,
+) => Promise<Entity[]>;
+
+/**
  * Entity after human review. Extends the base Entity
  * with a review decision.
  */
@@ -293,6 +306,7 @@ export type CustomRegexPattern = {
   pattern: string;
   label: string;
   score?: number;
+  preparedArtifactPolicy?: "include" | "omit";
 };
 
 /**
@@ -417,6 +431,12 @@ export type PipelineConfig = {
    */
   enableCountries?: boolean;
   enableNer: boolean;
+  /**
+   * Pluggable NER backend. When `enableNer` is set and this callback is
+   * provided, detected NER spans are merged into the redaction result. The
+   * label set and threshold come from `labels` / `threshold`.
+   */
+  nerInference?: NerInferenceFn;
   enableConfidenceBoost: boolean;
   enableCoreference: boolean;
   enableZoneClassification?: boolean;

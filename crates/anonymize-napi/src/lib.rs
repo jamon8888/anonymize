@@ -9,18 +9,26 @@ use napi_derive::napi;
 use stella_anonymize_adapter_contract::{
   BindingOperatorConfig, BindingOperatorEntry, BindingPreparedSearchConfig,
   BindingRedactionResult, BindingStaticRedactionResult, ContractError,
+  PreparedSearchPackageDecodeTimings, assemble_static_search_config,
+  diagnostic_events_to_utf16_binding, diagnostic_stage_event,
   operator_config_from_binding, prepared_search_config_from_binding,
   prepared_search_core_package_to_bytes,
   prepared_search_core_package_to_compressed_bytes,
-  prepared_search_core_package_view_from_bytes,
+  prepared_search_core_package_view_from_bytes_with_timings,
+  prepared_search_core_package_view_trusted_from_bytes_with_timings,
+  prepared_search_package_decode_timing_events, prepared_search_package_digest,
   prepared_search_package_from_bytes, prepared_search_package_has_core_payload,
+  prepared_search_package_verify_digest_with_timings,
   static_redaction_diagnostic_result_to_utf16_binding,
   static_redaction_diagnostics_to_binding,
   static_redaction_result_to_utf16_binding,
+  static_redaction_stream_event_to_utf16_binding,
 };
 use stella_anonymize_core::{
-  DiagnosticEvent, DiagnosticEventKind, DiagnosticStage, PreparedSearch,
-  PreparedSearchArtifacts, PreparedSearchConfig, StaticRedactionDiagnostics,
+  DiagnosticDetail, DiagnosticEvent, DiagnosticStage, Error as CoreError,
+  OperatorConfig, PreparedEngine, PreparedEngineArtifactsView,
+  PreparedEngineConfig, StaticRedactionDiagnostics,
+  assemble::{AssembleError, Dictionaries, GazetteerEntry, PipelineConfig},
 };
 
 const PREPARED_SEARCH_CACHE_LIMIT: usize = 8;
@@ -29,7 +37,7 @@ static PREPARED_SEARCH_CACHE: LazyLock<Mutex<PreparedSearchCache>> =
   LazyLock::new(|| Mutex::new(PreparedSearchCache::new()));
 
 struct PreparedSearchCache {
-  entries: BTreeMap<[u8; 32], Arc<PreparedSearch>>,
+  entries: BTreeMap<[u8; 32], Arc<PreparedEngine>>,
   order: VecDeque<[u8; 32]>,
 }
 
@@ -41,14 +49,14 @@ impl PreparedSearchCache {
     }
   }
 
-  fn get(&mut self, key: &[u8; 32]) -> Option<Arc<PreparedSearch>> {
+  fn get(&mut self, key: &[u8; 32]) -> Option<Arc<PreparedEngine>> {
     let entry = self.entries.get(key).cloned()?;
     self.retain_order_without(key);
     self.order.push_back(*key);
     Some(entry)
   }
 
-  fn insert(&mut self, key: [u8; 32], value: Arc<PreparedSearch>) {
+  fn insert(&mut self, key: [u8; 32], value: Arc<PreparedEngine>) {
     self.entries.insert(key, value);
     self.retain_order_without(&key);
     self.order.push_back(key);
@@ -76,6 +84,8 @@ pub struct JsSearchPattern {
   pub prefilter_any: Option<Vec<String>>,
   pub prefilter_case_insensitive: Option<bool>,
   pub prefilter_regex: Option<String>,
+  pub prefilter_window_bytes: Option<u32>,
+  pub prepared_artifact_policy: Option<String>,
 }
 
 #[napi(object)]
@@ -84,6 +94,7 @@ pub struct JsSearchOptions {
   pub literal_whole_words: Option<bool>,
   pub regex_whole_words: Option<bool>,
   pub regex_overlap_all: Option<bool>,
+  pub regex_artifact_policy: Option<String>,
   pub fuzzy_case_insensitive: Option<bool>,
   pub fuzzy_whole_words: Option<bool>,
   pub fuzzy_normalize_diacritics: Option<bool>,
@@ -248,7 +259,7 @@ pub fn redact_static_entities_json(
     .map(serde_json::from_str::<BindingOperatorConfig>)
     .transpose()
     .map_err(|error| to_napi_serde_error(&error))?;
-  let prepared = PreparedSearch::new(
+  let prepared = PreparedEngine::new(
     prepared_search_config_from_binding(config)
       .map_err(|error| to_napi_contract_error(&error))?,
   )
@@ -273,32 +284,62 @@ pub fn redact_static_entities_diagnostics_json(
   full_text: String,
   operators_json: Option<String>,
 ) -> Result<String> {
-  let config =
-    serde_json::from_str::<BindingPreparedSearchConfig>(&config_json)
-      .map_err(|error| to_napi_serde_error(&error))?;
+  redact_static_entities_diagnostics_json_with_detail(
+    &config_json,
+    &full_text,
+    operators_json.as_deref(),
+    DiagnosticDetail::Detailed,
+  )
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn redact_static_entities_summary_diagnostics_json(
+  config_json: String,
+  full_text: String,
+  operators_json: Option<String>,
+) -> Result<String> {
+  redact_static_entities_diagnostics_json_with_detail(
+    &config_json,
+    &full_text,
+    operators_json.as_deref(),
+    DiagnosticDetail::Summary,
+  )
+}
+
+fn redact_static_entities_diagnostics_json_with_detail(
+  config_json: &str,
+  full_text: &str,
+  operators_json: Option<&str>,
+  detail: DiagnosticDetail,
+) -> Result<String> {
+  let config = serde_json::from_str::<BindingPreparedSearchConfig>(config_json)
+    .map_err(|error| to_napi_serde_error(&error))?;
   let operators = operators_json
-    .as_deref()
     .map(serde_json::from_str::<BindingOperatorConfig>)
     .transpose()
     .map_err(|error| to_napi_serde_error(&error))?;
-  let prepared = PreparedSearch::new_with_diagnostics(
+  let prepared = PreparedEngine::new_with_diagnostics(
     prepared_search_config_from_binding(config)
       .map_err(|error| to_napi_contract_error(&error))?,
   )
   .map_err(|error| to_napi_core_error(&error))?;
   let mut diagnostics = prepared.diagnostics;
-  let mut result = prepared
-    .prepared
-    .redact_static_entities_with_diagnostics(
-      &full_text,
-      &operator_config_from_binding(operators)
-        .map_err(|error| to_napi_contract_error(&error))?,
-    )
-    .map_err(|error| to_napi_core_error(&error))?;
+  let operators = operator_config_from_binding(operators)
+    .map_err(|error| to_napi_contract_error(&error))?;
+  let mut result = match detail {
+    DiagnosticDetail::Detailed => prepared
+      .prepared
+      .redact_static_entities_with_diagnostics(full_text, &operators),
+    DiagnosticDetail::Summary => prepared
+      .prepared
+      .redact_static_entities_with_summary_diagnostics(full_text, &operators),
+  }
+  .map_err(|error| to_napi_core_error(&error))?;
   diagnostics.extend(result.diagnostics);
   result.diagnostics = diagnostics;
   let result =
-    static_redaction_diagnostic_result_to_utf16_binding(result, &full_text)
+    static_redaction_diagnostic_result_to_utf16_binding(result, full_text)
       .map_err(|error| to_napi_contract_error(&error))?;
 
   serde_json::to_string(&result).map_err(|error| to_napi_serde_error(&error))
@@ -314,7 +355,7 @@ pub fn prepare_static_search_artifacts_bytes(
       .map_err(|error| to_napi_serde_error(&error))?;
   let config = prepared_search_config_from_binding(config)
     .map_err(|error| to_napi_contract_error(&error))?;
-  PreparedSearch::prepare_artifacts(config)
+  PreparedEngine::prepare_artifacts(config)
     .and_then(|artifacts| artifacts.to_bytes())
     .map(Buffer::from)
     .map_err(|error| to_napi_core_error(&error))
@@ -345,7 +386,7 @@ fn prepare_static_search_package_bytes_with(
       .map_err(|error| to_napi_serde_error(&error))?;
   let core_config = prepared_search_config_from_binding(binding_config)
     .map_err(|error| to_napi_contract_error(&error))?;
-  let artifacts = PreparedSearch::prepare_artifacts(core_config.clone())
+  let artifacts = PreparedEngine::prepare_artifacts(core_config.clone())
     .map_err(|error| to_napi_core_error(&error))?;
   let artifact_bytes = artifacts
     .to_bytes()
@@ -359,28 +400,154 @@ fn prepare_static_search_package_bytes_with(
     prepared_search_core_package_to_bytes(&core_config, &artifact_bytes)
   };
   let package = package.map_err(|error| to_napi_contract_error(&error))?;
-  let prepared = PreparedSearch::new_with_artifacts(core_config, &artifacts)
+  let prepared = PreparedEngine::new_with_artifacts(core_config, &artifacts)
     .map_err(|error| to_napi_core_error(&error))?;
-  prepared_search_cache_insert(
-    prepared_search_package_cache_key(&package),
-    Arc::new(prepared),
-  );
+  let cache_key = prepared_search_package_digest(&package)
+    .map_err(|error| to_napi_contract_error(&error))?;
+  prepared_search_cache_insert(cache_key, Arc::new(prepared));
   Ok(Buffer::from(package))
+}
+
+/// Assembles a prepared static-search config (slice A: trivial fields) and
+/// returns it as JSON bytes, ready to feed the prepare/package path.
+#[napi(js_name = "assembleStaticSearchConfigJson")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn assemble_static_search_config_json(
+  pipeline_config_json: BufferSlice<'_>,
+  dictionaries_json: Option<BufferSlice<'_>>,
+  gazetteer_json: Option<BufferSlice<'_>>,
+) -> Result<Buffer> {
+  let config = assemble_binding_config(
+    pipeline_config_json.as_ref(),
+    dictionaries_json.as_ref().map(AsRef::as_ref),
+    gazetteer_json.as_ref().map(AsRef::as_ref),
+  )?;
+  serde_json::to_vec(&config)
+    .map(Buffer::from)
+    .map_err(|error| to_napi_serde_error(&error))
+}
+
+/// Assembles the config and chains it through the existing prepare/package
+/// path, returning ready-to-load core package bytes.
+#[napi(js_name = "assembleStaticSearchPackageBytes")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn assemble_static_search_package_bytes(
+  pipeline_config_json: BufferSlice<'_>,
+  dictionaries_json: Option<BufferSlice<'_>>,
+  gazetteer_json: Option<BufferSlice<'_>>,
+) -> Result<Buffer> {
+  let binding_config = assemble_binding_config(
+    pipeline_config_json.as_ref(),
+    dictionaries_json.as_ref().map(AsRef::as_ref),
+    gazetteer_json.as_ref().map(AsRef::as_ref),
+  )?;
+  assemble_core_package_bytes(binding_config, false).map(Buffer::from)
+}
+
+/// Assembles the config and chains it through the compressed prepare/package
+/// path, returning ready-to-load LZ4-compressed core package bytes.
+#[napi(js_name = "assembleStaticSearchCompressedPackageBytes")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn assemble_static_search_compressed_package_bytes(
+  pipeline_config_json: BufferSlice<'_>,
+  dictionaries_json: Option<BufferSlice<'_>>,
+  gazetteer_json: Option<BufferSlice<'_>>,
+) -> Result<Buffer> {
+  let binding_config = assemble_binding_config(
+    pipeline_config_json.as_ref(),
+    dictionaries_json.as_ref().map(AsRef::as_ref),
+    gazetteer_json.as_ref().map(AsRef::as_ref),
+  )?;
+  assemble_core_package_bytes(binding_config, true).map(Buffer::from)
+}
+
+/// Shared prepare/package tail for the assemble functions: turn a binding
+/// config into core package bytes, compressed or raw.
+fn assemble_core_package_bytes(
+  binding_config: BindingPreparedSearchConfig,
+  compressed: bool,
+) -> Result<Vec<u8>> {
+  let core_config = prepared_search_config_from_binding(binding_config)
+    .map_err(|error| to_napi_contract_error(&error))?;
+  let artifact_bytes = PreparedEngine::prepare_artifacts(core_config.clone())
+    .and_then(|artifacts| artifacts.to_bytes())
+    .map_err(|error| to_napi_core_error(&error))?;
+  let package = if compressed {
+    prepared_search_core_package_to_compressed_bytes(
+      &core_config,
+      &artifact_bytes,
+    )
+  } else {
+    prepared_search_core_package_to_bytes(&core_config, &artifact_bytes)
+  };
+  package.map_err(|error| to_napi_contract_error(&error))
+}
+
+fn assemble_binding_config(
+  pipeline_config_json: &[u8],
+  dictionaries_json: Option<&[u8]>,
+  gazetteer_json: Option<&[u8]>,
+) -> Result<BindingPreparedSearchConfig> {
+  let config = serde_json::from_slice::<PipelineConfig>(pipeline_config_json)
+    .map_err(|error| to_napi_serde_error(&error))?;
+  let dictionaries = match dictionaries_json {
+    Some(bytes) => Some(
+      serde_json::from_slice::<Dictionaries>(bytes)
+        .map_err(|error| to_napi_serde_error(&error))?,
+    ),
+    None => None,
+  };
+  let gazetteer = match gazetteer_json {
+    Some(bytes) => serde_json::from_slice::<Vec<GazetteerEntry>>(bytes)
+      .map_err(|error| to_napi_serde_error(&error))?,
+    None => Vec::new(),
+  };
+  assemble_static_search_config(&config, dictionaries.as_ref(), &gazetteer)
+    .map_err(|error| to_napi_assemble_error(&error))
 }
 
 #[napi]
 pub struct NativePreparedSearch {
-  inner: Arc<PreparedSearch>,
+  inner: Arc<PreparedEngine>,
   prepare_diagnostics: StaticRedactionDiagnostics,
 }
 
 #[derive(Clone, Copy)]
 struct PrepareContext {
   input_bytes_len: usize,
-  cache_key: [u8; 32],
-  cache_elapsed: u64,
+  cache: PrepareCache,
   parse_elapsed: u64,
   parse_stage: DiagnosticStage,
+  package_decode_timings: Option<PreparedSearchPackageDecodeTimings>,
+}
+
+#[derive(Clone, Copy)]
+enum PrepareCache {
+  Reuse {
+    key: [u8; 32],
+    key_elapsed: u64,
+    lookup_elapsed: u64,
+  },
+  Bypass,
+}
+
+#[derive(Clone, Copy)]
+enum PackageCacheMode {
+  Reuse,
+  Bypass,
+}
+
+#[derive(Clone, Copy)]
+enum PackageDecodeMode {
+  Verified,
+  Trusted,
+}
+
+#[derive(Clone, Copy)]
+struct CacheLookup {
+  key: [u8; 32],
+  key_elapsed: u64,
+  lookup_elapsed: u64,
 }
 
 #[napi]
@@ -411,7 +578,47 @@ impl NativePreparedSearch {
   pub fn from_prepared_package_bytes(
     package_bytes: BufferSlice<'_>,
   ) -> Result<Self> {
-    Self::from_package_bytes(package_bytes.as_ref())
+    Self::from_package_bytes(
+      package_bytes.as_ref(),
+      PackageCacheMode::Reuse,
+      PackageDecodeMode::Verified,
+    )
+  }
+
+  #[napi(factory)]
+  #[allow(clippy::needless_pass_by_value)]
+  pub fn from_prepared_package_bytes_without_cache(
+    package_bytes: BufferSlice<'_>,
+  ) -> Result<Self> {
+    Self::from_package_bytes(
+      package_bytes.as_ref(),
+      PackageCacheMode::Bypass,
+      PackageDecodeMode::Verified,
+    )
+  }
+
+  #[napi(factory)]
+  #[allow(clippy::needless_pass_by_value)]
+  pub fn from_trusted_prepared_package_bytes(
+    package_bytes: BufferSlice<'_>,
+  ) -> Result<Self> {
+    Self::from_package_bytes(
+      package_bytes.as_ref(),
+      PackageCacheMode::Reuse,
+      PackageDecodeMode::Trusted,
+    )
+  }
+
+  #[napi(factory)]
+  #[allow(clippy::needless_pass_by_value)]
+  pub fn from_trusted_prepared_package_bytes_without_cache(
+    package_bytes: BufferSlice<'_>,
+  ) -> Result<Self> {
+    Self::from_package_bytes(
+      package_bytes.as_ref(),
+      PackageCacheMode::Bypass,
+      PackageDecodeMode::Trusted,
+    )
   }
 
   fn from_config_bytes(
@@ -421,76 +628,128 @@ impl NativePreparedSearch {
     let input_bytes_len = config_bytes
       .len()
       .saturating_add(artifact_bytes.map_or(0, <[u8]>::len));
+    let cache_key_start = Instant::now();
     let cache_key = prepared_search_cache_key(config_bytes, artifact_bytes);
+    let cache_key_elapsed = elapsed_us(cache_key_start);
     let cache_start = Instant::now();
     if let Some(inner) = prepared_search_cache_get(&cache_key) {
+      let cache = CacheLookup {
+        key: cache_key,
+        key_elapsed: cache_key_elapsed,
+        lookup_elapsed: elapsed_us(cache_start),
+      };
       return Ok(Self {
         inner,
         prepare_diagnostics: StaticRedactionDiagnostics {
-          events: vec![stage_event(
-            DiagnosticStage::PrepareCacheHit,
-            Some(1),
-            Some(elapsed_us(cache_start)),
-            Some(input_bytes_len),
-          )],
+          events: cache_hit_events(&cache, input_bytes_len),
+          ..StaticRedactionDiagnostics::default()
         },
       });
     }
+    let cache = CacheLookup {
+      key: cache_key,
+      key_elapsed: cache_key_elapsed,
+      lookup_elapsed: elapsed_us(cache_start),
+    };
 
-    let cache_elapsed = elapsed_us(cache_start);
     let parse_start = Instant::now();
     let config =
       serde_json::from_slice::<BindingPreparedSearchConfig>(config_bytes)
         .map_err(|error| to_napi_serde_error(&error))?;
     let parse_elapsed = elapsed_us(parse_start);
-    Self::from_binding_config(
-      config,
-      artifact_bytes,
-      PrepareContext {
-        input_bytes_len,
-        cache_key,
-        cache_elapsed,
-        parse_elapsed,
-        parse_stage: DiagnosticStage::PrepareBindingParse,
+    let context = PrepareContext {
+      input_bytes_len,
+      cache: PrepareCache::Reuse {
+        key: cache.key,
+        key_elapsed: cache.key_elapsed,
+        lookup_elapsed: cache.lookup_elapsed,
       },
-    )
+      parse_elapsed,
+      parse_stage: DiagnosticStage::PrepareBindingParse,
+      package_decode_timings: None,
+    };
+    Self::from_binding_config(config, artifact_bytes, &context)
   }
 
-  fn from_package_bytes(package_bytes: &[u8]) -> Result<Self> {
+  fn from_package_bytes(
+    package_bytes: &[u8],
+    cache_mode: PackageCacheMode,
+    decode_mode: PackageDecodeMode,
+  ) -> Result<Self> {
     let input_bytes_len = package_bytes.len();
-    let cache_key = prepared_search_package_cache_key(package_bytes);
-    let cache_start = Instant::now();
-    if let Some(inner) = prepared_search_cache_get(&cache_key) {
-      return Ok(Self {
-        inner,
-        prepare_diagnostics: StaticRedactionDiagnostics {
-          events: vec![stage_event(
-            DiagnosticStage::PrepareCacheHit,
-            Some(1),
-            Some(elapsed_us(cache_start)),
-            Some(input_bytes_len),
-          )],
-        },
-      });
-    }
-
-    let cache_elapsed = elapsed_us(cache_start);
+    let cache = match cache_mode {
+      PackageCacheMode::Reuse => {
+        let cache_key_start = Instant::now();
+        let cache_key = prepared_search_package_digest(package_bytes)
+          .map_err(|error| to_napi_contract_error(&error))?;
+        let cache_key_elapsed = elapsed_us(cache_key_start);
+        let cache_start = Instant::now();
+        if let Some(inner) = prepared_search_cache_get(&cache_key) {
+          let cache = CacheLookup {
+            key: cache_key,
+            key_elapsed: cache_key_elapsed,
+            lookup_elapsed: elapsed_us(cache_start),
+          };
+          let mut events = cache_hit_events(&cache, input_bytes_len);
+          if matches!(decode_mode, PackageDecodeMode::Verified) {
+            let verify_timings =
+              prepared_search_package_verify_digest_with_timings(package_bytes)
+                .map_err(|error| to_napi_contract_error(&error))?;
+            append_package_decode_timing_events_for_input(
+              &mut events,
+              verify_timings,
+              input_bytes_len,
+            );
+          }
+          return Ok(Self {
+            inner,
+            prepare_diagnostics: StaticRedactionDiagnostics {
+              events,
+              ..StaticRedactionDiagnostics::default()
+            },
+          });
+        }
+        let cache = CacheLookup {
+          key: cache_key,
+          key_elapsed: cache_key_elapsed,
+          lookup_elapsed: elapsed_us(cache_start),
+        };
+        PrepareCache::Reuse {
+          key: cache.key,
+          key_elapsed: cache.key_elapsed,
+          lookup_elapsed: cache.lookup_elapsed,
+        }
+      }
+      PackageCacheMode::Bypass => PrepareCache::Bypass,
+    };
     let parse_start = Instant::now();
     if prepared_search_package_has_core_payload(package_bytes) {
-      let package = prepared_search_core_package_view_from_bytes(package_bytes)
-        .map_err(|error| to_napi_contract_error(&error))?;
+      let (package, package_decode_timings) = match decode_mode {
+        PackageDecodeMode::Verified => {
+          prepared_search_core_package_view_from_bytes_with_timings(
+            package_bytes,
+          )
+        }
+        PackageDecodeMode::Trusted => {
+          prepared_search_core_package_view_trusted_from_bytes_with_timings(
+            package_bytes,
+          )
+        }
+      }
+      .map_err(|error| to_napi_contract_error(&error))?;
       let parse_elapsed = elapsed_us(parse_start);
       let config = package.config;
+      let context = PrepareContext {
+        input_bytes_len,
+        cache,
+        parse_elapsed,
+        parse_stage: DiagnosticStage::PreparePackageDecode,
+        package_decode_timings: Some(package_decode_timings),
+      };
       return Self::from_core_config(
         config,
-        Some(package.artifacts.as_ref()),
-        PrepareContext {
-          input_bytes_len,
-          cache_key,
-          cache_elapsed,
-          parse_elapsed,
-          parse_stage: DiagnosticStage::PreparePackageDecode,
-        },
+        Some(package.artifacts.as_bytes()),
+        &context,
         None,
       );
     }
@@ -500,23 +759,20 @@ impl NativePreparedSearch {
     let parse_elapsed = elapsed_us(parse_start);
     let config = package.config;
     let artifacts = package.artifacts;
-    Self::from_binding_config(
-      config,
-      Some(&artifacts),
-      PrepareContext {
-        input_bytes_len,
-        cache_key,
-        cache_elapsed,
-        parse_elapsed,
-        parse_stage: DiagnosticStage::PreparePackageDecode,
-      },
-    )
+    let context = PrepareContext {
+      input_bytes_len,
+      cache,
+      parse_elapsed,
+      parse_stage: DiagnosticStage::PreparePackageDecode,
+      package_decode_timings: None,
+    };
+    Self::from_binding_config(config, Some(&artifacts), &context)
   }
 
   fn from_binding_config(
     config: BindingPreparedSearchConfig,
     artifact_bytes: Option<&[u8]>,
-    context: PrepareContext,
+    context: &PrepareContext,
   ) -> Result<Self> {
     let convert_start = Instant::now();
     let config = prepared_search_config_from_binding(config)
@@ -532,53 +788,67 @@ impl NativePreparedSearch {
   }
 
   fn from_core_config(
-    config: PreparedSearchConfig,
+    config: PreparedEngineConfig,
     artifact_bytes: Option<&[u8]>,
-    context: PrepareContext,
+    context: &PrepareContext,
     binding_convert: Option<(usize, u64)>,
   ) -> Result<Self> {
     let artifact_decode_start = Instant::now();
     let artifacts = artifact_bytes
-      .map(PreparedSearchArtifacts::from_bytes)
+      .map(PreparedEngineArtifactsView::from_bytes)
       .transpose()
       .map_err(|error| to_napi_core_error(&error))?;
     let artifact_decode_elapsed =
       artifact_bytes.map(|_| elapsed_us(artifact_decode_start));
-    let result = if let Some(artifacts) = artifacts.as_ref() {
-      PreparedSearch::new_with_artifacts_diagnostics(config, artifacts)
+    let artifact_decode = match (artifact_decode_elapsed, artifact_bytes) {
+      (Some(elapsed), Some(bytes)) => Some((elapsed, bytes.len())),
+      _ => None,
+    };
+    Self::from_core_config_with_artifacts(
+      config,
+      artifacts.as_ref(),
+      artifact_decode,
+      context,
+      binding_convert,
+    )
+  }
+
+  fn from_core_config_with_artifacts(
+    config: PreparedEngineConfig,
+    artifacts: Option<&PreparedEngineArtifactsView<'_>>,
+    artifact_decode: Option<(u64, usize)>,
+    context: &PrepareContext,
+    binding_convert: Option<(usize, u64)>,
+  ) -> Result<Self> {
+    let result = if let Some(artifacts) = artifacts {
+      PreparedEngine::new_with_artifact_view_diagnostics(config, artifacts)
     } else {
-      PreparedSearch::new_with_diagnostics(config)
+      PreparedEngine::new_with_diagnostics(config)
     }
     .map_err(|error| to_napi_core_error(&error))?;
     let inner = Arc::new(result.prepared);
+    let mut events = cache_miss_events(context);
+    events.push(diagnostic_stage_event(
+      context.parse_stage,
+      None,
+      Some(context.parse_elapsed),
+      Some(context.input_bytes_len),
+    ));
+    append_package_decode_timing_events(&mut events, context);
     let mut diagnostics = StaticRedactionDiagnostics {
-      events: vec![
-        stage_event(
-          DiagnosticStage::PrepareCacheMiss,
-          Some(0),
-          Some(context.cache_elapsed),
-          Some(context.input_bytes_len),
-        ),
-        stage_event(
-          context.parse_stage,
-          None,
-          Some(context.parse_elapsed),
-          Some(context.input_bytes_len),
-        ),
-      ],
+      events,
+      ..StaticRedactionDiagnostics::default()
     };
     if let Some((pattern_count, convert_elapsed)) = binding_convert {
-      diagnostics.events.push(stage_event(
+      diagnostics.events.push(diagnostic_stage_event(
         DiagnosticStage::PrepareBindingConvert,
         Some(pattern_count),
         Some(convert_elapsed),
         None,
       ));
     }
-    if let (Some(elapsed), Some(bytes)) =
-      (artifact_decode_elapsed, artifact_bytes.map(<[u8]>::len))
-    {
-      diagnostics.events.push(stage_event(
+    if let Some((elapsed, bytes)) = artifact_decode {
+      diagnostics.events.push(diagnostic_stage_event(
         DiagnosticStage::PrepareArtifactsDecode,
         None,
         Some(elapsed),
@@ -586,7 +856,9 @@ impl NativePreparedSearch {
       ));
     }
     diagnostics.extend(result.diagnostics);
-    prepared_search_cache_insert(context.cache_key, Arc::clone(&inner));
+    if let PrepareCache::Reuse { key, .. } = context.cache {
+      prepared_search_cache_insert(key, Arc::clone(&inner));
+    }
     Ok(Self {
       inner,
       prepare_diagnostics: diagnostics,
@@ -597,6 +869,26 @@ impl NativePreparedSearch {
   pub fn prepare_diagnostics_json(&self) -> Result<String> {
     let diagnostics =
       static_redaction_diagnostics_to_binding(self.prepare_diagnostics.clone());
+
+    serde_json::to_string(&diagnostics)
+      .map_err(|error| to_napi_serde_error(&error))
+  }
+
+  #[napi]
+  pub fn warm_lazy_regex(&self) -> Result<()> {
+    self
+      .inner
+      .warm_lazy_regex()
+      .map_err(|error| to_napi_core_error(&error))
+  }
+
+  #[napi]
+  pub fn warm_lazy_regex_diagnostics_json(&self) -> Result<String> {
+    let diagnostics = self
+      .inner
+      .warm_lazy_regex_diagnostics()
+      .map_err(|error| to_napi_core_error(&error))?;
+    let diagnostics = static_redaction_diagnostics_to_binding(diagnostics);
 
     serde_json::to_string(&diagnostics)
       .map_err(|error| to_napi_serde_error(&error))
@@ -623,6 +915,57 @@ impl NativePreparedSearch {
 
   #[napi]
   #[allow(clippy::needless_pass_by_value)]
+  pub fn redact_static_entities_json(
+    &self,
+    full_text: String,
+    operators: Option<JsOperatorConfig>,
+  ) -> Result<String> {
+    let operators =
+      operator_config_from_binding(operators.map(to_binding_operator_config))
+        .map_err(|error| to_napi_contract_error(&error))?;
+    let result = self
+      .inner
+      .redact_static_entities(&full_text, &operators)
+      .map_err(|error| to_napi_core_error(&error))?;
+    let result = static_redaction_result_to_utf16_binding(result, &full_text)
+      .map_err(|error| to_napi_contract_error(&error))?;
+
+    serde_json::to_string(&result).map_err(|error| to_napi_serde_error(&error))
+  }
+
+  #[napi]
+  #[allow(clippy::needless_pass_by_value)]
+  pub fn redact_static_entities_result_stream_json(
+    &self,
+    full_text: String,
+    operators: Option<JsOperatorConfig>,
+    on_event: Function<'_, (String,), ()>,
+  ) -> Result<String> {
+    let operators =
+      operator_config_from_binding(operators.map(to_binding_operator_config))
+        .map_err(|error| to_napi_contract_error(&error))?;
+    let result = self
+      .inner
+      .redact_static_entities_with_result_observer(
+        &full_text,
+        &operators,
+        |event| {
+          let event_json = result_stream_event_json(event, &full_text)?;
+          on_event
+            .call((event_json,))
+            .map_err(|error| core_result_observer_error(error.to_string()))?;
+          Ok(())
+        },
+      )
+      .map_err(|error| to_napi_core_error(&error))?;
+    let result = static_redaction_result_to_utf16_binding(result, &full_text)
+      .map_err(|error| to_napi_contract_error(&error))?;
+
+    serde_json::to_string(&result).map_err(|error| to_napi_serde_error(&error))
+  }
+
+  #[napi]
+  #[allow(clippy::needless_pass_by_value)]
   pub fn redact_static_entities_diagnostics_json(
     &self,
     full_text: String,
@@ -631,9 +974,55 @@ impl NativePreparedSearch {
     let operators =
       operator_config_from_binding(operators.map(to_binding_operator_config))
         .map_err(|error| to_napi_contract_error(&error))?;
+    self.redact_static_entities_diagnostics_json_inner(
+      &full_text,
+      &operators,
+      DiagnosticDetail::Detailed,
+    )
+  }
+
+  #[napi]
+  #[allow(clippy::needless_pass_by_value)]
+  pub fn redact_static_entities_summary_diagnostics_json(
+    &self,
+    full_text: String,
+    operators: Option<JsOperatorConfig>,
+  ) -> Result<String> {
+    let operators =
+      operator_config_from_binding(operators.map(to_binding_operator_config))
+        .map_err(|error| to_napi_contract_error(&error))?;
+    self.redact_static_entities_diagnostics_json_inner(
+      &full_text,
+      &operators,
+      DiagnosticDetail::Summary,
+    )
+  }
+
+  #[napi]
+  #[allow(clippy::needless_pass_by_value)]
+  pub fn redact_static_entities_diagnostics_stream_json(
+    &self,
+    full_text: String,
+    operators: Option<JsOperatorConfig>,
+    on_batch: Function<'_, (String,), ()>,
+  ) -> Result<String> {
+    let operators =
+      operator_config_from_binding(operators.map(to_binding_operator_config))
+        .map_err(|error| to_napi_contract_error(&error))?;
+    emit_prepare_diagnostics_batch(&self.prepare_diagnostics, &on_batch)?;
     let mut result = self
       .inner
-      .redact_static_entities_with_diagnostics(&full_text, &operators)
+      .redact_static_entities_with_diagnostics_observer(
+        &full_text,
+        &operators,
+        |events| {
+          let batch_json = diagnostic_event_batch_json(events, &full_text)?;
+          on_batch
+            .call((batch_json,))
+            .map_err(|error| core_observer_error(error.to_string()))?;
+          Ok(())
+        },
+      )
       .map_err(|error| to_napi_core_error(&error))?;
     let mut diagnostics = self.prepare_diagnostics.clone();
     diagnostics.extend(result.diagnostics);
@@ -644,22 +1033,184 @@ impl NativePreparedSearch {
 
     serde_json::to_string(&result).map_err(|error| to_napi_serde_error(&error))
   }
+
+  fn redact_static_entities_diagnostics_json_inner(
+    &self,
+    full_text: &str,
+    operators: &OperatorConfig,
+    detail: DiagnosticDetail,
+  ) -> Result<String> {
+    let mut result = match detail {
+      DiagnosticDetail::Detailed => self
+        .inner
+        .redact_static_entities_with_diagnostics(full_text, operators),
+      DiagnosticDetail::Summary => self
+        .inner
+        .redact_static_entities_with_summary_diagnostics(full_text, operators),
+    }
+    .map_err(|error| to_napi_core_error(&error))?;
+    let mut diagnostics = self.prepare_diagnostics.clone();
+    diagnostics.extend(result.diagnostics);
+    result.diagnostics = diagnostics;
+    let result =
+      static_redaction_diagnostic_result_to_utf16_binding(result, full_text)
+        .map_err(|error| to_napi_contract_error(&error))?;
+
+    serde_json::to_string(&result).map_err(|error| to_napi_serde_error(&error))
+  }
 }
 
-const fn prepared_search_pattern_count(config: &PreparedSearchConfig) -> usize {
+fn emit_prepare_diagnostics_batch(
+  diagnostics: &StaticRedactionDiagnostics,
+  on_batch: &Function<'_, (String,), ()>,
+) -> Result<()> {
+  if diagnostics.events.is_empty() {
+    return Ok(());
+  }
+  let diagnostics =
+    static_redaction_diagnostics_to_binding(diagnostics.clone());
+  let batch_json = serde_json::to_string(&diagnostics)
+    .map_err(|error| to_napi_serde_error(&error))?;
+  on_batch.call((batch_json,))
+}
+
+fn diagnostic_event_batch_json(
+  events: &[DiagnosticEvent],
+  full_text: &str,
+) -> stella_anonymize_core::Result<String> {
+  let diagnostics = diagnostic_events_to_utf16_binding(events, full_text)
+    .map_err(|error| {
+      core_observer_error(format!(
+        "diagnostic batch conversion failed: {error}"
+      ))
+    })?;
+  serde_json::to_string(&diagnostics).map_err(|error| {
+    core_observer_error(format!(
+      "diagnostic batch serialization failed: {error}"
+    ))
+  })
+}
+
+fn result_stream_event_json(
+  event: stella_anonymize_core::StaticRedactionStreamEvent<'_>,
+  full_text: &str,
+) -> stella_anonymize_core::Result<String> {
+  let event = static_redaction_stream_event_to_utf16_binding(event, full_text)
+    .map_err(|error| {
+      core_result_observer_error(format!(
+        "result event conversion failed: {error}"
+      ))
+    })?;
+  serde_json::to_string(&event).map_err(|error| {
+    core_result_observer_error(format!(
+      "result event serialization failed: {error}"
+    ))
+  })
+}
+
+const fn core_result_observer_error(reason: String) -> CoreError {
+  CoreError::InvalidStaticData {
+    field: "result.observer",
+    reason,
+  }
+}
+
+const fn core_observer_error(reason: String) -> CoreError {
+  CoreError::InvalidStaticData {
+    field: "diagnostics.observer",
+    reason,
+  }
+}
+
+const fn prepared_search_pattern_count(config: &PreparedEngineConfig) -> usize {
   config
+    .search
     .regex_patterns
     .len()
-    .saturating_add(config.custom_regex_patterns.len())
-    .saturating_add(config.literal_patterns.len())
+    .saturating_add(config.search.custom_regex_patterns.len())
+    .saturating_add(config.search.literal_patterns.len())
 }
 
-fn prepared_search_cache_get(key: &[u8; 32]) -> Option<Arc<PreparedSearch>> {
+fn prepared_search_cache_get(key: &[u8; 32]) -> Option<Arc<PreparedEngine>> {
   with_prepared_search_cache(|cache| cache.get(key))
 }
 
-fn prepared_search_cache_insert(key: [u8; 32], value: Arc<PreparedSearch>) {
+fn prepared_search_cache_insert(key: [u8; 32], value: Arc<PreparedEngine>) {
   with_prepared_search_cache(|cache| cache.insert(key, value));
+}
+
+fn cache_hit_events(
+  cache: &CacheLookup,
+  input_bytes_len: usize,
+) -> Vec<DiagnosticEvent> {
+  vec![
+    diagnostic_stage_event(
+      DiagnosticStage::PrepareCacheKey,
+      None,
+      Some(cache.key_elapsed),
+      Some(input_bytes_len),
+    ),
+    diagnostic_stage_event(
+      DiagnosticStage::PrepareCacheHit,
+      Some(1),
+      Some(cache.lookup_elapsed),
+      Some(input_bytes_len),
+    ),
+  ]
+}
+
+fn cache_miss_events(context: &PrepareContext) -> Vec<DiagnosticEvent> {
+  match context.cache {
+    PrepareCache::Reuse {
+      key_elapsed,
+      lookup_elapsed,
+      ..
+    } => vec![
+      diagnostic_stage_event(
+        DiagnosticStage::PrepareCacheKey,
+        None,
+        Some(key_elapsed),
+        Some(context.input_bytes_len),
+      ),
+      diagnostic_stage_event(
+        DiagnosticStage::PrepareCacheMiss,
+        Some(0),
+        Some(lookup_elapsed),
+        Some(context.input_bytes_len),
+      ),
+    ],
+    PrepareCache::Bypass => vec![diagnostic_stage_event(
+      DiagnosticStage::PrepareCacheBypass,
+      Some(0),
+      Some(0),
+      Some(context.input_bytes_len),
+    )],
+  }
+}
+
+fn append_package_decode_timing_events(
+  events: &mut Vec<DiagnosticEvent>,
+  context: &PrepareContext,
+) {
+  let Some(timings) = context.package_decode_timings else {
+    return;
+  };
+  append_package_decode_timing_events_for_input(
+    events,
+    timings,
+    context.input_bytes_len,
+  );
+}
+
+fn append_package_decode_timing_events_for_input(
+  events: &mut Vec<DiagnosticEvent>,
+  timings: PreparedSearchPackageDecodeTimings,
+  input_bytes_len: usize,
+) {
+  events.extend(prepared_search_package_decode_timing_events(
+    timings,
+    input_bytes_len,
+  ));
 }
 
 fn prepared_search_cache_key(
@@ -678,13 +1229,6 @@ fn prepared_search_cache_key(
       hasher.update(b"no-artifacts");
     }
   }
-  *hasher.finalize().as_bytes()
-}
-
-fn prepared_search_package_cache_key(package_bytes: &[u8]) -> [u8; 32] {
-  let mut hasher = blake3::Hasher::new();
-  hasher.update(b"prepared-package");
-  hasher.update(package_bytes);
   *hasher.finalize().as_bytes()
 }
 
@@ -763,32 +1307,6 @@ fn to_js_operator_entries(
     .collect()
 }
 
-const fn stage_event(
-  stage: DiagnosticStage,
-  count: Option<usize>,
-  elapsed_us: Option<u64>,
-  input_bytes: Option<usize>,
-) -> DiagnosticEvent {
-  DiagnosticEvent {
-    stage,
-    kind: DiagnosticEventKind::StageSummary,
-    count,
-    engine: None,
-    pattern: None,
-    source: None,
-    source_detail: None,
-    label: None,
-    start: None,
-    end: None,
-    text: None,
-    score: None,
-    span_valid: None,
-    elapsed_us,
-    input_bytes,
-    reason: None,
-  }
-}
-
 fn elapsed_us(start: Instant) -> u64 {
   let micros = start.elapsed().as_micros();
   u64::try_from(micros).unwrap_or(u64::MAX)
@@ -803,5 +1321,9 @@ fn to_napi_contract_error(error: &ContractError) -> Error {
 }
 
 fn to_napi_serde_error(error: &serde_json::Error) -> Error {
+  Error::from_reason(error.to_string())
+}
+
+fn to_napi_assemble_error(error: &AssembleError) -> Error {
   Error::from_reason(error.to_string())
 }
